@@ -10,7 +10,7 @@
 | **Power Button** | **Verified** | Short press (`<3 s`) terminates local `tty1` sessions + toggles OLED; long press (`>=4 s`) triggers graceful `systemctl poweroff`. |
 | **USB Gadget Networking** | **Verified** | USB ECM `usb0` + SSH/SCP/SFTP verified. |
 | **Wi-Fi (BCM4375)** | **Partial** | Link reported; Wi-Fi SSH and transport qualification not established. Device-specific firmware required. |
-| **USB serial console** | **Maintainer-confirmed** | Local serial recovery; not independent of the running kernel/rootfs. |
+| **USB serial console** | Local serial recovery; not independent of the running kernel/rootfs. |
 | **Battery & Thermal Telemetry** | **Verified** | `max170xx_battery`, `max77705-charger`, and Exynos 990 ACPM TMU thermal zones (`boros-health.timer`). |
 | **Hardware Thermal / Battery Cutoffs** | **Unverified** | Configured in DTS/drivers; live fault/overheat actuation intentionally not forced. |
 | **GPU Acceleration (Mali-G77)** | **Unsupported** | Not enabled in this headless/console/TUI configuration. |
