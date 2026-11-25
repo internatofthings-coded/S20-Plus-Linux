@@ -7,8 +7,8 @@ import tempfile
 from pathlib import Path
 
 EXPECTED_PINS = {
-    "ratatui": "0.29.0",
-    "crossterm": "0.28.1",
+    "ratatui": ["0.30.2"],
+    "crossterm": ["0.28.1", "0.29.0"],
 }
 
 FORBIDDEN_CRATES = {
@@ -65,7 +65,7 @@ def audit_lockfile(path):
 
     for req_name, req_ver in EXPECTED_PINS.items():
         vers = by_name.get(req_name, [])
-        if vers != [req_ver]:
+        if sorted(vers) != sorted(req_ver):
             errors.append(f"FAIL: expected {req_name}=={req_ver}, found {vers}")
 
     dups = {k: v for k, v in by_name.items() if len(v) > 1}
@@ -87,7 +87,7 @@ version = "0.1.0"
 
 [[package]]
 name = "ratatui"
-version = "0.29.0"
+version = "0.30.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "abc123"
 
@@ -96,6 +96,12 @@ name = "crossterm"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "def456"
+
+[[package]]
+name = "crossterm"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abc789"
 """
     bad = good + """
 [[package]]
@@ -111,7 +117,7 @@ source = "git+https://example.com/reqwest"
 
         errs, summary = audit_lockfile(gp)
         assert not errs, f"expected clean audit, got {errs}"
-        assert summary["external_packages"] == 2
+        assert summary["external_packages"] == 3
 
         errs_bad, _ = audit_lockfile(bp)
         assert len(errs_bad) >= 3, f"expected >=3 errors for bad lockfile, got {errs_bad}"
