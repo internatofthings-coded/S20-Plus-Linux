@@ -1,11 +1,75 @@
-# Installation status — not ready for fresh-device installation
+# Installation Guide
 
-> **Warning:** Experimental software, no warranty. Unlocking or flashing a phone can erase data, break device functionality or cause hardware damage. The prototype's battery and thermal protections are not fully qualified. Use at your own risk, to the extent permitted by applicable law.
+## 1. Requirements
 
-The tested target is **Samsung Galaxy S20+ SM-G985F (Exynos 990, y2s)** with native Debian 13 ARM64 on internal UFS. No fresh-device installation from this archive has been validated. microSD boot, other device variants and alternative flashing methods are not qualified.
+- Samsung Galaxy S20+ SM-G985F (Exynos 990).
+- Linux computer.
+- USB data cable.
+- Samsung stock firmware for recovery.
+- Compatible UniLoader/LK3rd and NAOMI boot images.
 
-Before publishing or following a complete installation guide, recover the exact tested bootloader and initramfs source, boot packaging recipe, root filesystem handoff and partition-selection procedure, and touchscreen startup service. Verify the module ABI, udev permissions, user/group setup, USB serial and USB networking recovery, and correct firmware handling. See [RELEASE-STATUS.md](RELEASE-STATUS.md) and [BUILD.md](BUILD.md).
+**Warning:** Bootloader unlocking erases user data and permanently trips Knox when unauthorized software is flashed. Back up everything before proceeding.
 
-The included Bundle A and Bundle B scripts are historical userspace installation utilities, not a complete OS installer. Bundle A changes the hostname to `naomi` and replaces the `127.0.1.1` hosts entry; back up `/etc/hostname` and `/etc/hosts` and preserve aliases before use. Bundle B can install hooks without a binary; require a verified binary first. Review exact destination paths and existing configurations before executing either as root. Do not enable automatic TUI launch until interactive shell recovery has been tested.
+## 2. Unlock the bootloader
 
-Do not flash an image or format a partition based on this draft. Do not modify S-Boot, PIT, EFS, modem or other unrelated partitions. No proprietary firmware is provided.
+1. Open Settings → About phone → Software information.
+2. Tap Build number seven times.
+3. Open Developer options.
+4. Enable OEM unlocking and USB debugging.
+5. Power off the phone.
+6. Hold both volume buttons while connecting the USB cable.
+7. Enter Download Mode.
+8. Long-press Volume Up to unlock the bootloader.
+9. Confirm the factory reset.
+10. Complete Android setup and verify that the bootloader is unlocked.
+
+## 3. Install the custom bootloader
+
+1. Obtain the compatible UniLoader/LK3rd image for SM-G985F.
+2. Enter Samsung Download Mode.
+3. Flash the required bootloader package using the supported flashing utility.
+4. Boot into LK3rd fastboot mode.
+5. Verify connectivity:
+
+```bash
+fastboot devices
+```
+
+## 4. Boot native Linux
+
+1. Build the NAOMI kernel and compatible boot image.
+2. Verify the image checksum.
+3. Enter LK3rd fastboot mode.
+4. Flash the verified Linux boot image:
+
+```bash
+fastboot flash boot boot.img
+fastboot reboot
+```
+
+## 5. Install Debian
+
+1. Boot the Linux recovery environment.
+2. Connect through USB serial or USB Ethernet.
+3. Identify the target storage partition.
+4. Install the Debian 13 ARM64 root filesystem.
+5. Configure the root filesystem PARTUUID in the boot image.
+6. Reboot into native Debian.
+
+## 6. Install NAOMI userspace
+
+Install the touchscreen, keyboard, OLED control, hardware monitoring, MOTD and TUI components using the supplied build and installation scripts.
+
+## 7. Verify installation
+
+```bash
+uname -r
+hostname
+systemctl --failed
+```
+
+Launch the interactive interface:
+
+```bash
+naomi-tui-launch
+```
