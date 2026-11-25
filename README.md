@@ -42,6 +42,6 @@ Wi-Fi link operation was reported during development; Wi-Fi SSH and broader netw
 
 ## Credits
 
- **Bentlybro** and the Exynos 990 Linux community for the foundational work that made this project possible.  Linux, Samsung's open-source contributors, Debian, postmarketOS/Buffyboard, Ratatui and Crossterm. Development was directed and physically test on my personal device.
+ **Bentlybro** and the Exynos 990 Linux community for the foundational work that made this project possible.  Linux, Samsung's open-source contributors, Debian, postmarketOS/Buffyboard, Ratatui and Crossterm. Development was directed and physically tested on my personal device(s).
 
 See [Acknowledgments](ACKNOWLEDGMENTS.md) for the detailed credits and [Third-party notices](THIRD-PARTY-NOTICES.md) for source links and license information.
