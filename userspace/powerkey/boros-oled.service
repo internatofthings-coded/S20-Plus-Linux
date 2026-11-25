@@ -1,0 +1,15 @@
+[Unit]
+Description=BOROS OLED Power Control Module (boros_oled)
+ConditionKernelVersion=6.12.119-g970959bbf675
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=boros-powerkeyd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/modprobe boros_oled
+ExecStop=/sbin/modprobe -r boros_oled
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,185 @@
+From 970959bbf67542b61dafb1c8d459c3d1c73a0735 Mon Sep 17 00:00:00 2001
+From: Boros Maintainer <boros@local>
+Date: Wed, 25 Nov 2026 02:48:39 +0800
+Subject: [PATCH] regulator: add Samsung S2DOS05 touchscreen rail regulator
+ driver
+
+---
+ drivers/regulator/Kconfig             |   9 ++
+ drivers/regulator/Makefile            |   1 +
+ drivers/regulator/s2dos05-regulator.c | 131 ++++++++++++++++++++++++++
+ 3 files changed, 141 insertions(+)
+ create mode 100644 drivers/regulator/s2dos05-regulator.c
+
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index 39297f7d8..d15d768e2 100644
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -1322,6 +1322,15 @@ config REGULATOR_RTQ2208
+ 	  and two ldos. It features wide output voltage range from 0.4V to 2.05V
+ 	  and the capability to configure the corresponding power stages.
+ 
++config REGULATOR_S2DOS05
++	tristate "Samsung S2DOS05 display sub-PMIC touchscreen rail regulator"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  This driver supports the touchscreen supply rails (LDO2/LDO3) of the
++	  Samsung S2DOS05 display sub-PMIC over I2C, leaving OLED panel rails
++	  untouched.
++
+ config REGULATOR_S2MPA01
+ 	tristate "Samsung S2MPA01 voltage regulator"
+ 	depends on MFD_SEC_CORE || COMPILE_TEST
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 3d5a803dc..9b69546fb 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -154,6 +154,7 @@ obj-$(CONFIG_REGULATOR_RTMV20)	+= rtmv20-regulator.o
+ obj-$(CONFIG_REGULATOR_RTQ2134) += rtq2134-regulator.o
+ obj-$(CONFIG_REGULATOR_RTQ6752)	+= rtq6752-regulator.o
+ obj-$(CONFIG_REGULATOR_RTQ2208) += rtq2208-regulator.o
++obj-$(CONFIG_REGULATOR_S2DOS05) += s2dos05-regulator.o
+ obj-$(CONFIG_REGULATOR_S2MPA01) += s2mpa01.o
+ obj-$(CONFIG_REGULATOR_S2MPS11) += s2mps11.o
+ obj-$(CONFIG_REGULATOR_S5M8767) += s5m8767.o
+diff --git a/drivers/regulator/s2dos05-regulator.c b/drivers/regulator/s2dos05-regulator.c
+new file mode 100644
+index 000000000..9185ec50c
+--- /dev/null
++++ b/drivers/regulator/s2dos05-regulator.c
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Samsung S2DOS05 display sub-PMIC - touchscreen rail regulators
++ *
++ * The S2DOS05 sits on its own I2C bus and powers both the AMOLED panel
++ * (BUCK1/LDO1/LDO4/ELVSS) and the touchscreen rails
++ * (LDO2 = tsp_io 1.8V, LDO3 = tsp_avdd 3.0V).
++ *
++ * We deliberately expose ONLY the two touch rails. The panel rails are brought
++ * up by the bootloader and are what keeps the display alive; registering them
++ * here would let the regulator core disable them as "unused" and blank the
++ * screen. Enable/disable go through regmap_update_bits() on the single shared
++ * enable register, so only our own bits are ever modified.
++ */
++
++#include <linux/bits.h>
++#include <linux/i2c.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++
++#define S2DOS05_REG_EN		0x03
++#define S2DOS05_REG_LDO2_CFG	0x05
++#define S2DOS05_REG_LDO3_CFG	0x06
++#define S2DOS05_REG_MAX		0x11
++
++#define S2DOS05_EN_LDO2		BIT(1)
++#define S2DOS05_EN_LDO3		BIT(2)
++
++#define S2DOS05_LDO_VSEL_MASK	0x7f
++#define S2DOS05_LDO_STEP_UV	25000
++#define S2DOS05_LDO2_MIN_UV	1500000
++#define S2DOS05_LDO3_MIN_UV	2700000
++#define S2DOS05_LDO_N_VOLTAGES	(S2DOS05_LDO_VSEL_MASK + 1)
++
++static const struct regulator_ops s2dos05_ldo_ops = {
++	.enable			= regulator_enable_regmap,
++	.disable		= regulator_disable_regmap,
++	.is_enabled		= regulator_is_enabled_regmap,
++	.list_voltage		= regulator_list_voltage_linear,
++	.map_voltage		= regulator_map_voltage_linear,
++	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
++	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
++};
++
++#define S2DOS05_LDO(_id, _name, _min_uV, _en_mask, _vsel_reg)		\
++	{								\
++		.name		 = (_name),				\
++		.of_match	 = of_match_ptr(_name),			\
++		.regulators_node = of_match_ptr("regulators"),		\
++		.id		 = (_id),				\
++		.ops		 = &s2dos05_ldo_ops,			\
++		.type		 = REGULATOR_VOLTAGE,			\
++		.owner		 = THIS_MODULE,				\
++		.min_uV		 = (_min_uV),				\
++		.uV_step	 = S2DOS05_LDO_STEP_UV,			\
++		.n_voltages	 = S2DOS05_LDO_N_VOLTAGES,		\
++		.vsel_reg	 = (_vsel_reg),				\
++		.vsel_mask	 = S2DOS05_LDO_VSEL_MASK,		\
++		.enable_reg	 = S2DOS05_REG_EN,			\
++		.enable_mask	 = (_en_mask),				\
++	}
++
++static const struct regulator_desc s2dos05_regulators[] = {
++	S2DOS05_LDO(0, "ldo2", S2DOS05_LDO2_MIN_UV, S2DOS05_EN_LDO2,
++		    S2DOS05_REG_LDO2_CFG),
++	S2DOS05_LDO(1, "ldo3", S2DOS05_LDO3_MIN_UV, S2DOS05_EN_LDO3,
++		    S2DOS05_REG_LDO3_CFG),
++};
++
++static const struct regmap_config s2dos05_regmap_config = {
++	.reg_bits	= 8,
++	.val_bits	= 8,
++	.max_register	= S2DOS05_REG_MAX,
++};
++
++static int s2dos05_probe(struct i2c_client *client)
++{
++	struct regulator_config config = { };
++	struct regmap *regmap;
++	unsigned int val;
++	int i, ret;
++
++	regmap = devm_regmap_init_i2c(client, &s2dos05_regmap_config);
++	if (IS_ERR(regmap))
++		return dev_err_probe(&client->dev, PTR_ERR(regmap),
++				     "failed to init regmap\n");
++
++	/* Sanity-check the chip actually answers before registering rails. */
++	ret = regmap_read(regmap, S2DOS05_REG_EN, &val);
++	if (ret)
++		return dev_err_probe(&client->dev, ret,
++				     "S2DOS05 not responding\n");
++
++	dev_info(&client->dev, "S2DOS05 display sub-PMIC (EN=0x%02x)\n", val);
++
++	config.dev = &client->dev;
++	config.regmap = regmap;
++
++	for (i = 0; i < ARRAY_SIZE(s2dos05_regulators); i++) {
++		struct regulator_dev *rdev;
++
++		rdev = devm_regulator_register(&client->dev,
++					       &s2dos05_regulators[i], &config);
++		if (IS_ERR(rdev))
++			return dev_err_probe(&client->dev, PTR_ERR(rdev),
++					     "failed to register %s\n",
++					     s2dos05_regulators[i].name);
++	}
++
++	return 0;
++}
++
++static const struct of_device_id s2dos05_of_match[] = {
++	{ .compatible = "samsung,s2dos05" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, s2dos05_of_match);
++
++static struct i2c_driver s2dos05_driver = {
++	.driver = {
++		.name		= "s2dos05-regulator",
++		.of_match_table	= s2dos05_of_match,
++	},
++	.probe = s2dos05_probe,
++};
++module_i2c_driver(s2dos05_driver);
++
++MODULE_DESCRIPTION("Samsung S2DOS05 display sub-PMIC regulator driver");
++MODULE_LICENSE("GPL");
+-- 
+2.56.1
+

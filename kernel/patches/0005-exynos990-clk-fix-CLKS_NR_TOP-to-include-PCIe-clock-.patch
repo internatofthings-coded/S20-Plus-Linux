@@ -1,0 +1,26 @@
+From 2680f4024178eeefc430f34db3f8ca9fcd9dd171 Mon Sep 17 00:00:00 2001
+From: Boros Maintainer <boros@local>
+Date: Tue, 24 Nov 2026 05:20:34 +0800
+Subject: [PATCH 05/10] exynos990: clk: fix CLKS_NR_TOP to include PCIe clock
+ index 171
+
+---
+ drivers/clk/samsung/clk-exynos990.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/clk/samsung/clk-exynos990.c b/drivers/clk/samsung/clk-exynos990.c
+index 1fc1f5848..295700fce 100644
+--- a/drivers/clk/samsung/clk-exynos990.c
++++ b/drivers/clk/samsung/clk-exynos990.c
+@@ -11,7 +11,7 @@
+ #include "clk-cpu.h"
+ #include "clk-exynos-arm64.h"
+ 
+-#define CLKS_NR_TOP (CLK_GOUT_CMU_APM_BUS + 1)
++#define CLKS_NR_TOP (CLK_GOUT_CMU_VRA_BUS + 1)
+ #define CLKS_NR_HSI0 (CLK_GOUT_HSI0_XIU_ACLK + 1)
+ 
+ /* CMU_TOP (FILL THIS IN)*/	
+-- 
+2.56.1
+

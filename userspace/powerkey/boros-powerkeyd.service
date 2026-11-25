@@ -1,0 +1,23 @@
+[Unit]
+Description=BOROS Power-Button Display Lock and OLED Power Manager
+ConditionKernelVersion=6.12.119-g970959bbf675
+ConditionPathExists=/sys/kernel/boros_oled/power
+After=boros-oled.service boros-buffyboard.service getty@tty1.service systemd-logind.service
+Wants=boros-oled.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/boros-powerkeyd.py
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+MemoryAccounting=yes
+MemoryMax=32M
+CPUAccounting=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,693 @@
+From 56f41055e8f65850971b891608aff11408895f87 Mon Sep 17 00:00:00 2001
+From: Boros Maintainer <boros@local>
+Date: Tue, 24 Nov 2026 04:29:46 +0800
+Subject: [PATCH 03/10] boros: add Exynos990 PCIe and BCM4375B1 brcmfmac with
+ S2MPU DMA isolation
+
+---
+ .../broadcom/brcm80211/brcmfmac/Makefile      |   3 +-
+ .../broadcom/brcm80211/brcmfmac/bus.h         |   1 +
+ .../broadcom/brcm80211/brcmfmac/chip.c        |   1 +
+ .../broadcom/brcm80211/brcmfmac/pcie.c        |  21 +-
+ .../broadcom/brcm80211/brcmfmac/s2mpu.c       | 241 ++++++++++++++++++
+ .../broadcom/brcm80211/brcmfmac/s2mpu.h       |  39 +++
+ .../broadcom/brcm80211/include/brcm_hw_ids.h  |   2 +
+ drivers/pci/controller/dwc/pci-exynos.c       | 189 +++++++++++++-
+ 8 files changed, 491 insertions(+), 6 deletions(-)
+ create mode 100644 drivers/net/wireless/broadcom/brcm80211/brcmfmac/s2mpu.c
+ create mode 100644 drivers/net/wireless/broadcom/brcm80211/brcmfmac/s2mpu.h
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Makefile b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Makefile
+index e5ca0f511..508541882 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Makefile
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Makefile
+@@ -39,7 +39,8 @@ brcmfmac-$(CONFIG_BRCMFMAC_SDIO) += \
+ brcmfmac-$(CONFIG_BRCMFMAC_USB) += \
+ 		usb.o
+ brcmfmac-$(CONFIG_BRCMFMAC_PCIE) += \
+-		pcie.o
++		pcie.o \
++		s2mpu.o
+ brcmfmac-$(CONFIG_BRCMDBG) += \
+ 		debug.o
+ brcmfmac-$(CONFIG_BRCM_TRACING) += \
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h
+index 9371c1489..2e675b831 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h
+@@ -338,6 +338,7 @@ static inline int brcmf_usb_register(void) { return 0; }
+ #endif
+ 
+ #ifdef CONFIG_BRCMFMAC_PCIE
++#include "s2mpu.h"
+ void brcmf_pcie_exit(void);
+ int brcmf_pcie_register(void);
+ #else
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
+index e3a01a28a..d40dfe294 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c
+@@ -739,6 +739,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
+ 	case CY_CC_4373_CHIP_ID:
+ 		return 0x160000;
+ 	case BRCM_CC_43752_CHIP_ID:
++	case BRCM_CC_4375_CHIP_ID:
+ 	case BRCM_CC_4377_CHIP_ID:
+ 		return 0x170000;
+ 	case BRCM_CC_4378_CHIP_ID:
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index 48224588c..7de1f9684 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -66,6 +66,7 @@ BRCMF_FW_DEF(4365C, "brcmfmac4365c-pcie");
+ BRCMF_FW_DEF(4366B, "brcmfmac4366b-pcie");
+ BRCMF_FW_DEF(4366C, "brcmfmac4366c-pcie");
+ BRCMF_FW_DEF(4371, "brcmfmac4371-pcie");
++BRCMF_FW_CLM_DEF(4375, "brcmfmac4375-pcie");
+ BRCMF_FW_CLM_DEF(4377B3, "brcmfmac4377b3-pcie");
+ BRCMF_FW_CLM_DEF(4378B1, "brcmfmac4378b1-pcie");
+ BRCMF_FW_CLM_DEF(4378B3, "brcmfmac4378b3-pcie");
+@@ -104,6 +105,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43664_CHIP_ID, 0xFFFFFFF0, 4366C),
+ 	BRCMF_FW_ENTRY(BRCM_CC_43666_CHIP_ID, 0xFFFFFFF0, 4366C),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4371_CHIP_ID, 0xFFFFFFFF, 4371),
++	BRCMF_FW_ENTRY(BRCM_CC_4375_CHIP_ID, 0xFFFFFFFF, 4375),
+ 	BRCMF_FW_ENTRY(BRCM_CC_4377_CHIP_ID, 0xFFFFFFFF, 4377B3), /* revision ID 4 */
+ 	BRCMF_FW_ENTRY(BRCM_CC_4378_CHIP_ID, 0x0000000F, 4378B1), /* revision ID 3 */
+ 	BRCMF_FW_ENTRY(BRCM_CC_4378_CHIP_ID, 0xFFFFFFE0, 4378B3), /* revision ID 5 */
+@@ -967,7 +969,11 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
+ 
+ 	brcmf_dbg(PCIE, "Enter\n");
+ 
+-	pci_enable_msi(pdev);
++	/* Exynos990 BCM4375 uses platform legacy INTx instead of DWC MSI */
++	if (pdev->device == BRCM_PCIE_4375_DEVICE_ID)
++		dev_info(&pdev->dev, "BCM4375 using platform legacy INTx\n");
++	else
++		pci_enable_msi(pdev);
+ 	if (request_threaded_irq(pdev->irq, brcmf_pcie_quick_check_isr,
+ 				 brcmf_pcie_isr_thread, IRQF_SHARED,
+ 				 "brcmf_pcie_intr", devinfo)) {
+@@ -1657,6 +1663,18 @@ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
+ 	addr = sharedram_addr + BRCMF_SHARED_RING_INFO_ADDR_OFFSET;
+ 	shared->ring_info_addr = brcmf_pcie_read_tcm32(devinfo, addr);
+ 
++	if (shared->version >= 6) {
++		u32 host_cap = shared->version |
++			       0x00000400 |
++			       0x00001000 |
++			       0x00020000 |
++			       0x00800000;
++		brcmf_pcie_write_tcm32(devinfo, sharedram_addr + 84, host_cap);
++		dev_info(&devinfo->pdev->dev,
++			 "z3s: wrote host_cap=%#010x at shared+84 (ipc v%u)\n",
++			 host_cap, shared->version);
++	}
++
+ 	brcmf_dbg(PCIE, "max rx buf post %d, rx dataoffset %d\n",
+ 		  shared->max_rxbufpost, shared->rx_dataoffset);
+ 
+@@ -2705,6 +2723,7 @@ static const struct pci_device_id brcmf_pcie_devid_table[] = {
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4366_5G_DEVICE_ID, BCA),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4371_DEVICE_ID, WCC),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_43596_DEVICE_ID, CYW),
++	BRCMF_PCIE_DEVICE(BRCM_PCIE_4375_DEVICE_ID, WCC),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4377_DEVICE_ID, WCC),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4378_DEVICE_ID, WCC),
+ 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4387_DEVICE_ID, WCC),
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/s2mpu.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/s2mpu.c
+new file mode 100644
+index 000000000..b0f8f606a
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/s2mpu.c
+@@ -0,0 +1,241 @@
++// SPDX-License-Identifier: ISC
++/*
++ * Samsung Exynos990 protects PCIe DMA with an EL2-managed stage-2 memory
++ * protection unit (S2MPU).  The stock z3s kernel grants and revokes HSI1
++ * access in its DMA map operations.  Mainline DMA operations do not know
++ * about that vendor ABI, so BCM4375 firmware boots but traps on its first
++ * host-memory transfer.
++ *
++ * Keep this compatibility layer local to Samsung's BCM4375 PCI ID.  It
++ * wraps every coherent and streaming DMA mapping used by brcmfmac and
++ * mirrors the stock 64 KiB reference-counted grant scheme.
++ */
++
++#include <linux/arm-smccc.h>
++#include <linux/dma-mapping.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/spinlock.h>
++
++#define BRCMFMAC_S2MPU_IMPLEMENTATION
++#include "s2mpu.h"
++
++#define BCM4375_VENDOR_ID		0x14e4
++#define BCM4375_PCIE_DEVICE_ID		0x4475
++
++#define EXYNOS_HVC_SET_S2MPU_FOR_WIFI	0xc6000101UL
++#define EXYNOS_S2MPU_WIFI_VID		1UL
++#define EXYNOS_S2MPU_HSI1_INDEX		24UL
++#define EXYNOS_S2MPU_ARG1		((EXYNOS_S2MPU_WIFI_VID << 16) | \
++					 EXYNOS_S2MPU_HSI1_INDEX)
++
++#define EXYNOS_S2MPU_NO_ACCESS		0UL
++#define EXYNOS_S2MPU_READ_WRITE		3UL
++#define EXYNOS_S2MPU_GRANULE		SZ_64K
++#define EXYNOS_S2MPU_LOW_RAM_BASE	0x80000000ULL
++#define EXYNOS_S2MPU_LOW_RAM_END	0x100000000ULL
++#define EXYNOS_S2MPU_LOW_RAM_PAGES	((EXYNOS_S2MPU_LOW_RAM_END - \
++					  EXYNOS_S2MPU_LOW_RAM_BASE) / \
++					 EXYNOS_S2MPU_GRANULE)
++
++static DEFINE_SPINLOCK(brcmf_s2mpu_lock);
++static u32 brcmf_s2mpu_refs[EXYNOS_S2MPU_LOW_RAM_PAGES];
++
++static bool brcmf_s2mpu_required(struct device *dev)
++{
++	struct pci_dev *pdev;
++
++	if (!dev_is_pci(dev))
++		return false;
++
++	pdev = to_pci_dev(dev);
++	return pdev->vendor == BCM4375_VENDOR_ID &&
++	       pdev->device == BCM4375_PCIE_DEVICE_ID;
++}
++
++static unsigned long brcmf_s2mpu_hvc(dma_addr_t base,
++				     unsigned long permission)
++{
++	struct arm_smccc_res res = {};
++
++	/* Samsung's exynos_hvc() executes a full-system barrier first. */
++	mb();
++	arm_smccc_hvc(EXYNOS_HVC_SET_S2MPU_FOR_WIFI,
++		      EXYNOS_S2MPU_ARG1, base, EXYNOS_S2MPU_GRANULE,
++		      permission, 0, 0, 0, &res);
++	mb();
++
++	return res.a0;
++}
++
++static int brcmf_s2mpu_bounds(dma_addr_t dma_addr, size_t size,
++			      dma_addr_t *first, dma_addr_t *last)
++{
++	u64 end;
++
++	if (!size)
++		return -EINVAL;
++	if (check_add_overflow((u64)dma_addr, (u64)size, &end))
++		return -EOVERFLOW;
++
++	*first = round_down(dma_addr, (dma_addr_t)EXYNOS_S2MPU_GRANULE);
++	*last = round_up(end, (u64)EXYNOS_S2MPU_GRANULE);
++
++	if (*first < EXYNOS_S2MPU_LOW_RAM_BASE ||
++	    *last > EXYNOS_S2MPU_LOW_RAM_END)
++		return -ERANGE;
++
++	return 0;
++}
++
++static int brcmf_s2mpu_grant(struct device *dev, dma_addr_t dma_addr,
++			     size_t size)
++{
++	dma_addr_t first;
++	dma_addr_t last;
++	dma_addr_t addr;
++	unsigned long flags;
++	unsigned long hvc_ret;
++	u32 index;
++	int ret;
++
++	ret = brcmf_s2mpu_bounds(dma_addr, size, &first, &last);
++	if (ret) {
++		dev_err(dev, "S2MPU cannot cover DMA %pad+%zu: %d\n",
++			&dma_addr, size, ret);
++		return ret;
++	}
++
++	spin_lock_irqsave(&brcmf_s2mpu_lock, flags);
++	for (addr = first; addr < last; addr += EXYNOS_S2MPU_GRANULE) {
++		index = (addr - EXYNOS_S2MPU_LOW_RAM_BASE) /
++			EXYNOS_S2MPU_GRANULE;
++		if (brcmf_s2mpu_refs[index] == U32_MAX) {
++			ret = -EOVERFLOW;
++			goto rollback;
++		}
++		if (!brcmf_s2mpu_refs[index]) {
++			hvc_ret = brcmf_s2mpu_hvc(addr,
++						 EXYNOS_S2MPU_READ_WRITE);
++			if (hvc_ret) {
++				dev_err(dev,
++					"S2MPU grant failed for %pad: 0x%lx\n",
++					&addr, hvc_ret);
++				ret = -EIO;
++				goto rollback;
++			}
++		}
++		brcmf_s2mpu_refs[index]++;
++	}
++	spin_unlock_irqrestore(&brcmf_s2mpu_lock, flags);
++
++	pr_info_once("brcmfmac: Exynos990 HSI1 S2MPU DMA grants enabled\n");
++	return 0;
++
++rollback:
++	while (addr > first) {
++		addr -= EXYNOS_S2MPU_GRANULE;
++		index = (addr - EXYNOS_S2MPU_LOW_RAM_BASE) /
++			EXYNOS_S2MPU_GRANULE;
++		brcmf_s2mpu_refs[index]--;
++		if (!brcmf_s2mpu_refs[index])
++			brcmf_s2mpu_hvc(addr, EXYNOS_S2MPU_NO_ACCESS);
++	}
++	spin_unlock_irqrestore(&brcmf_s2mpu_lock, flags);
++	return ret;
++}
++
++static void brcmf_s2mpu_revoke(struct device *dev, dma_addr_t dma_addr,
++			       size_t size)
++{
++	dma_addr_t first;
++	dma_addr_t last;
++	dma_addr_t addr;
++	unsigned long flags;
++	unsigned long hvc_ret;
++	u32 index;
++	int ret;
++
++	ret = brcmf_s2mpu_bounds(dma_addr, size, &first, &last);
++	if (ret) {
++		dev_err(dev, "S2MPU cannot revoke DMA %pad+%zu: %d\n",
++			&dma_addr, size, ret);
++		return;
++	}
++
++	spin_lock_irqsave(&brcmf_s2mpu_lock, flags);
++	for (addr = first; addr < last; addr += EXYNOS_S2MPU_GRANULE) {
++		index = (addr - EXYNOS_S2MPU_LOW_RAM_BASE) /
++			EXYNOS_S2MPU_GRANULE;
++		if (!brcmf_s2mpu_refs[index]) {
++			dev_warn(dev, "unbalanced S2MPU revoke for %pad\n",
++				 &addr);
++			continue;
++		}
++
++		brcmf_s2mpu_refs[index]--;
++		if (!brcmf_s2mpu_refs[index]) {
++			hvc_ret = brcmf_s2mpu_hvc(addr,
++						  EXYNOS_S2MPU_NO_ACCESS);
++			if (hvc_ret) {
++				dev_err(dev,
++					"S2MPU revoke failed for %pad: 0x%lx\n",
++					&addr, hvc_ret);
++				brcmf_s2mpu_refs[index]++;
++			}
++		}
++	}
++	spin_unlock_irqrestore(&brcmf_s2mpu_lock, flags);
++}
++
++void *brcmf_dma_alloc_coherent(struct device *dev, size_t size,
++			       dma_addr_t *dma_handle, gfp_t gfp)
++{
++	void *cpu_addr;
++
++	cpu_addr = dma_alloc_attrs(dev, size, dma_handle, gfp, 0);
++	if (!cpu_addr || !brcmf_s2mpu_required(dev))
++		return cpu_addr;
++
++	if (brcmf_s2mpu_grant(dev, *dma_handle, size)) {
++		dma_free_attrs(dev, size, cpu_addr, *dma_handle, 0);
++		return NULL;
++	}
++
++	return cpu_addr;
++}
++
++void brcmf_dma_free_coherent(struct device *dev, size_t size,
++			     void *cpu_addr, dma_addr_t dma_handle)
++{
++	if (brcmf_s2mpu_required(dev))
++		brcmf_s2mpu_revoke(dev, dma_handle, size);
++	dma_free_attrs(dev, size, cpu_addr, dma_handle, 0);
++}
++
++dma_addr_t brcmf_dma_map_single(struct device *dev, void *cpu_addr,
++				size_t size,
++				enum dma_data_direction direction)
++{
++	dma_addr_t dma_addr;
++
++	dma_addr = dma_map_single_attrs(dev, cpu_addr, size, direction, 0);
++	if (dma_mapping_error(dev, dma_addr) || !brcmf_s2mpu_required(dev))
++		return dma_addr;
++
++	if (brcmf_s2mpu_grant(dev, dma_addr, size)) {
++		dma_unmap_single_attrs(dev, dma_addr, size, direction, 0);
++		return DMA_MAPPING_ERROR;
++	}
++
++	return dma_addr;
++}
++
++void brcmf_dma_unmap_single(struct device *dev, dma_addr_t dma_addr,
++			    size_t size,
++			    enum dma_data_direction direction)
++{
++	if (brcmf_s2mpu_required(dev))
++		brcmf_s2mpu_revoke(dev, dma_addr, size);
++	dma_unmap_single_attrs(dev, dma_addr, size, direction, 0);
++}
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/s2mpu.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/s2mpu.h
+new file mode 100644
+index 000000000..8f2a2d63c
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/s2mpu.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: ISC */
++/*
++ * Exynos990 HSI1 S2MPU-aware DMA wrappers for the z3s BCM4375 port.
++ */
++
++#ifndef BRCMFMAC_S2MPU_H
++#define BRCMFMAC_S2MPU_H
++
++#include <linux/dma-mapping.h>
++
++void *brcmf_dma_alloc_coherent(struct device *dev, size_t size,
++			       dma_addr_t *dma_handle, gfp_t gfp);
++void brcmf_dma_free_coherent(struct device *dev, size_t size,
++			     void *cpu_addr, dma_addr_t dma_handle);
++dma_addr_t brcmf_dma_map_single(struct device *dev, void *cpu_addr,
++				size_t size,
++				enum dma_data_direction direction);
++void brcmf_dma_unmap_single(struct device *dev, dma_addr_t dma_addr,
++			    size_t size,
++			    enum dma_data_direction direction);
++
++/*
++ * bus.h includes this after the normal DMA API headers.  Restrict the
++ * substitutions to brcmfmac translation units.  The implementation defines
++ * BRCMFMAC_S2MPU_IMPLEMENTATION and calls the attrs forms of the underlying
++ * DMA API directly.
++ */
++#ifndef BRCMFMAC_S2MPU_IMPLEMENTATION
++#undef dma_alloc_coherent
++#undef dma_free_coherent
++#undef dma_map_single
++#undef dma_unmap_single
++#define dma_alloc_coherent	brcmf_dma_alloc_coherent
++#define dma_free_coherent	brcmf_dma_free_coherent
++#define dma_map_single		brcmf_dma_map_single
++#define dma_unmap_single	brcmf_dma_unmap_single
++#endif
++
++#endif /* BRCMFMAC_S2MPU_H */
+diff --git a/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h b/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h
+index 2f886af06..7f0abbda0 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h
++++ b/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h
+@@ -52,6 +52,7 @@
+ #define BRCM_CC_43664_CHIP_ID		43664
+ #define BRCM_CC_43666_CHIP_ID		43666
+ #define BRCM_CC_4371_CHIP_ID		0x4371
++#define BRCM_CC_4375_CHIP_ID		0x4375
+ #define BRCM_CC_43752_CHIP_ID		43752
+ #define BRCM_CC_4377_CHIP_ID		0x4377
+ #define BRCM_CC_4378_CHIP_ID		0x4378
+@@ -94,6 +95,7 @@
+ #define BRCM_PCIE_4366_5G_DEVICE_ID	0x43c5
+ #define BRCM_PCIE_4371_DEVICE_ID	0x440d
+ #define BRCM_PCIE_43596_DEVICE_ID	0x4415
++#define BRCM_PCIE_4375_DEVICE_ID	0x4475
+ #define BRCM_PCIE_4377_DEVICE_ID	0x4488
+ #define BRCM_PCIE_4378_DEVICE_ID	0x4425
+ #define BRCM_PCIE_4387_DEVICE_ID	0x4433
+diff --git a/drivers/pci/controller/dwc/pci-exynos.c b/drivers/pci/controller/dwc/pci-exynos.c
+index fa45da28a..d47d7aaad 100644
+--- a/drivers/pci/controller/dwc/pci-exynos.c
++++ b/drivers/pci/controller/dwc/pci-exynos.c
+@@ -11,6 +11,7 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/delay.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/interrupt.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+@@ -20,6 +21,8 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
++#include <linux/mfd/syscon.h>
++#include <linux/regmap.h>
+ 
+ #include "pcie-designware.h"
+ 
+@@ -54,11 +57,131 @@
+ struct exynos_pcie {
+ 	struct dw_pcie			pci;
+ 	void __iomem			*elbi_base;
++	void __iomem			*phy_base;
++	void __iomem			*pcs_base;
++	void __iomem			*cmu_base;
++	struct regmap			*sysreg;
++	struct regmap			*pmu;
+ 	struct clk_bulk_data		*clks;
+ 	struct phy			*phy;
++	struct gpio_desc		*perst;
++	bool				is_exynos990;
+ 	struct regulator_bulk_data	supplies[2];
+ };
+ 
++/* Exynos9830/990 HSI1 CMU local gates used by the Gen2 x1 controller. */
++#define HSI1_PCIE_MUX_USER		0x0620
++#define HSI1_PCIE_REF_GATE		0x2000
++#define HSI1_PCIE_DBI_GATE		0x2024
++#define HSI1_PCIE_PHY_APB_GATE		0x2028
++#define HSI1_PCIE_MSTR_GATE		0x202c
++#define HSI1_PCIE_CTRL_APB_GATE		0x2030
++#define HSI1_PCIE_PCS_APB_GATE		0x2034
++#define HSI1_PCIE_SLV_GATE		0x2038
++#define EXYNOS990_CLK_GATE_ENABLE	BIT(21)
++#define EXYNOS990_PCIE_PHY_CONTROL	0x0718
++#define EXYNOS990_PCIE_SOFT_CORE_RESET	0x01d0
++#define EXYNOS990_PCIE_QCH_SEL		0x02c8
++
++static void exynos990_hsi1_gate(struct exynos_pcie *ep, u32 reg)
++{
++	u32 val = readl(ep->cmu_base + reg);
++
++	writel(val | EXYNOS990_CLK_GATE_ENABLE, ep->cmu_base + reg);
++}
++
++static void exynos990_pcie_enable_clocks(struct exynos_pcie *ep)
++{
++	u32 val;
++
++	/* Select the CLKCMU_HSI1_PCIE parent and ungate every Gen2 path. */
++	val = readl(ep->cmu_base + HSI1_PCIE_MUX_USER);
++	writel(val | BIT(4), ep->cmu_base + HSI1_PCIE_MUX_USER);
++	exynos990_hsi1_gate(ep, HSI1_PCIE_REF_GATE);
++	exynos990_hsi1_gate(ep, HSI1_PCIE_DBI_GATE);
++	exynos990_hsi1_gate(ep, HSI1_PCIE_PHY_APB_GATE);
++	exynos990_hsi1_gate(ep, HSI1_PCIE_MSTR_GATE);
++	exynos990_hsi1_gate(ep, HSI1_PCIE_CTRL_APB_GATE);
++	exynos990_hsi1_gate(ep, HSI1_PCIE_PCS_APB_GATE);
++	exynos990_hsi1_gate(ep, HSI1_PCIE_SLV_GATE);
++}
++
++static void exynos990_pcie_phy_init(struct exynos_pcie *ep)
++{
++	static const u32 cmn[] = {
++		0x01, 0xe1, 0x05, 0x00, 0x88, 0x88, 0x88, 0x0c,
++		0x71, 0x45, 0x65, 0x24, 0x33, 0x18, 0xe3, 0xfc,
++		0xd8, 0x05, 0xe6, 0x80, 0x00, 0x00, 0x00, 0x00,
++		0x60, 0x11, 0x00, 0xa0, 0x05, 0x04, 0x18, 0x88,
++		0xc0, 0xff, 0x9b, 0x52, 0x22, 0x30, 0x4f, 0xdc,
++		0x40, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x80,
++	};
++	static const u32 trsv[] = {
++		0x31, 0x40, 0x37, 0x99, 0x85, 0x00, 0xc0, 0xff,
++		0xff, 0x3f, 0x8c, 0xc8, 0x02, 0x01, 0x88, 0x80,
++		0x06, 0x90, 0x6c, 0x66, 0x09, 0x61, 0x42, 0x44,
++		0xc6, 0x50, 0x0a, 0x33, 0x58, 0xe7, 0x20, 0x22,
++		0x80, 0x38, 0x05, 0x85, 0x00, 0x00, 0x00, 0x7e,
++		0x00, 0x00, 0x55, 0x15, 0xac, 0xaa, 0x3e, 0x00,
++		0x00, 0x00, 0x20, 0x3f, 0x00, 0x03, 0x40, 0x00,
++		0x10, 0x07, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
++		0x05, 0x85, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
++	};
++	u32 val;
++	int i;
++
++	/* PHY power and lane-0 routing, copied from Samsung's Exynos9830 BSP. */
++	regmap_update_bits(ep->pmu, EXYNOS990_PCIE_PHY_CONTROL, BIT(0), BIT(0));
++	regmap_read(ep->sysreg, 0, &val);
++	regmap_write(ep->sysreg, 0, val | BIT(1));
++	regmap_read(ep->sysreg, 0xc, &val);
++	val &= ~GENMASK(7, 2);
++	val |= 0x3 << 2;
++	val &= ~BIT(1);
++	val |= BIT(12);
++	regmap_write(ep->sysreg, 0xc, val);
++
++	/* BCM4375 PCS global reset. */
++	writel(1, ep->elbi_base + 0x288);
++	udelay(10);
++	writel(0, ep->elbi_base + 0x288);
++	udelay(10);
++	writel(1, ep->elbi_base + 0x288);
++	udelay(10);
++
++	for (i = 0; i < ARRAY_SIZE(cmn); i++)
++		writel(cmn[i], ep->phy_base + i * 4);
++	for (i = 0; i < ARRAY_SIZE(trsv); i++)
++		writel(trsv[i], ep->phy_base + (0x30 + i) * 4);
++
++	writel(0x70, ep->pcs_base + 0xf8);
++	writel(0x87, ep->pcs_base + 0x100);
++	writel(0x50, ep->pcs_base + 0x104);
++	val = readl(ep->pcs_base + 0x0c);
++	writel((val & ~BIT(1)) | BIT(4), ep->pcs_base + 0x0c);
++
++	/* MAC, common PHY and CDR reset sequence for Broadcom Wi-Fi. */
++	writel(1, ep->elbi_base + 0x290);
++	udelay(10);
++	writel(0, ep->elbi_base + 0x290);
++	udelay(10);
++	writel(1, ep->elbi_base + 0x290);
++	udelay(10);
++	writel(1, ep->elbi_base + 0x28c);
++	udelay(10);
++	writel(0, ep->elbi_base + 0x28c);
++	udelay(10);
++	writel(1, ep->elbi_base + 0x28c);
++	udelay(100);
++	val = readl(ep->pcs_base + 0xd0);
++	writel(val | (0x3 << 6), ep->pcs_base + 0xd0);
++	udelay(20);
++	val = readl(ep->pcs_base + 0xd0) & ~(0x3 << 6);
++	writel(val | (0x2 << 6), ep->pcs_base + 0xd0);
++	writel(val, ep->pcs_base + 0xd0);
++}
++
+ static void exynos_pcie_writel(void __iomem *base, u32 val, u32 reg)
+ {
+ 	writel(val, base + reg);
+@@ -123,6 +246,12 @@ static int exynos_pcie_start_link(struct dw_pcie *pci)
+ 	struct exynos_pcie *ep = to_exynos_pcie(pci);
+ 	u32 val;
+ 
++	if (ep->is_exynos990) {
++		/* Keep PERST asserted during PHY setup, then meet BCM's delay. */
++		gpiod_set_value_cansleep(ep->perst, 0);
++		usleep_range(18000, 20000);
++	}
++
+ 	val = exynos_pcie_readl(ep->elbi_base, PCIE_SW_WAKE);
+ 	val &= ~PCIE_BUS_EN;
+ 	exynos_pcie_writel(ep->elbi_base, val, PCIE_SW_WAKE);
+@@ -214,6 +343,11 @@ static int exynos_pcie_link_up(struct dw_pcie *pci)
+ 	struct exynos_pcie *ep = to_exynos_pcie(pci);
+ 	u32 val = exynos_pcie_readl(ep->elbi_base, PCIE_ELBI_RDLH_LINKUP);
+ 
++	if (ep->is_exynos990) {
++		val &= 0x1f;
++		return val >= 0x0d && val <= 0x14;
++	}
++
+ 	return (val & PCIE_ELBI_XMLH_LINKUP);
+ }
+ 
+@@ -224,6 +358,22 @@ static int exynos_pcie_host_init(struct dw_pcie_rp *pp)
+ 
+ 	pp->bridge->ops = &exynos_pci_ops;
+ 
++	if (ep->is_exynos990) {
++		gpiod_set_value_cansleep(ep->perst, 1);
++		exynos990_pcie_enable_clocks(ep);
++		exynos990_pcie_phy_init(ep);
++		/* Samsung establishes a clean DWC core after PHY calibration. */
++		writel(0, ep->elbi_base + EXYNOS990_PCIE_SOFT_CORE_RESET);
++		udelay(20);
++		writel(1, ep->elbi_base + EXYNOS990_PCIE_SOFT_CORE_RESET);
++		/* Keep AXI/APB/PMU clocks ungated during initial link training. */
++		writel(readl(ep->elbi_base + EXYNOS990_PCIE_QCH_SEL) &
++		       ~GENMASK(11, 0),
++		       ep->elbi_base + EXYNOS990_PCIE_QCH_SEL);
++		exynos_pcie_enable_irq_pulse(ep);
++		return 0;
++	}
++
+ 	exynos_pcie_assert_core_reset(ep);
+ 
+ 	phy_init(ep->phy);
+@@ -290,10 +440,8 @@ static int exynos_pcie_probe(struct platform_device *pdev)
+ 
+ 	ep->pci.dev = dev;
+ 	ep->pci.ops = &dw_pcie_ops;
+-
+-	ep->phy = devm_of_phy_get(dev, np, NULL);
+-	if (IS_ERR(ep->phy))
+-		return PTR_ERR(ep->phy);
++	ep->is_exynos990 = of_device_is_compatible(np,
++						   "samsung,exynos990-pcie");
+ 
+ 	/* External Local Bus interface (ELBI) registers */
+ 	ep->elbi_base = devm_platform_ioremap_resource_byname(pdev, "elbi");
+@@ -304,6 +452,38 @@ static int exynos_pcie_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	if (ep->is_exynos990) {
++		ep->phy_base =
++			devm_platform_ioremap_resource_byname(pdev, "phy");
++		if (IS_ERR(ep->phy_base))
++			return PTR_ERR(ep->phy_base);
++		ep->pcs_base =
++			devm_platform_ioremap_resource_byname(pdev, "pcs");
++		if (IS_ERR(ep->pcs_base))
++			return PTR_ERR(ep->pcs_base);
++		ep->sysreg = syscon_regmap_lookup_by_phandle(np,
++							    "samsung,sysreg");
++		if (IS_ERR(ep->sysreg))
++			return PTR_ERR(ep->sysreg);
++		ep->cmu_base =
++			devm_platform_ioremap_resource_byname(pdev, "cmu");
++		if (IS_ERR(ep->cmu_base))
++			return PTR_ERR(ep->cmu_base);
++		ep->pmu = syscon_regmap_lookup_by_phandle(np, "samsung,pmu");
++		if (IS_ERR(ep->pmu))
++			return PTR_ERR(ep->pmu);
++		ep->perst = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++		if (IS_ERR(ep->perst))
++			return dev_err_probe(dev, PTR_ERR(ep->perst),
++					     "failed to get PERST GPIO\n");
++		platform_set_drvdata(pdev, ep);
++		return exynos_add_pcie_port(ep, pdev);
++	}
++
++	ep->phy = devm_of_phy_get(dev, np, NULL);
++	if (IS_ERR(ep->phy))
++		return PTR_ERR(ep->phy);
++
+ 	ep->supplies[0].supply = "vdd18";
+ 	ep->supplies[1].supply = "vdd10";
+ 	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(ep->supplies),
+@@ -378,6 +558,7 @@ static const struct dev_pm_ops exynos_pcie_pm_ops = {
+ 
+ static const struct of_device_id exynos_pcie_of_match[] = {
+ 	{ .compatible = "samsung,exynos5433-pcie", },
++	{ .compatible = "samsung,exynos990-pcie", },
+ 	{ },
+ };
+ 
+-- 
+2.56.1
+

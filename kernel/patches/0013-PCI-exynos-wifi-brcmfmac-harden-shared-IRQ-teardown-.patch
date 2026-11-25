@@ -1,0 +1,236 @@
+From 1f53d0ce624cf275acf24b580c83a6c541599f8a Mon Sep 17 00:00:00 2001
+From: Boros Maintainer <boros@local>
+Date: Tue, 24 Nov 2026 16:32:37 +0800
+Subject: [PATCH 13/13] PCI: exynos / wifi: brcmfmac: harden shared IRQ
+ teardown and guard Exynos990 resume_noirq
+
+---
+ .../broadcom/brcm80211/brcmfmac/pcie.c        | 31 +++++++---
+ drivers/pci/controller/dwc/pci-exynos.c       | 62 ++++++++++++++++---
+ 2 files changed, 75 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index 43ff1059b..831d2e4f6 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -924,6 +924,9 @@ static irqreturn_t brcmf_pcie_quick_check_isr(int irq, void *arg)
+ {
+ 	struct brcmf_pciedev_info *devinfo = (struct brcmf_pciedev_info *)arg;
+ 
++	if (READ_ONCE(devinfo->state) != BRCMFMAC_PCIE_STATE_UP)
++		return IRQ_NONE;
++
+ 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->mailboxint)) {
+ 		brcmf_pcie_intr_disable(devinfo);
+ 		brcmf_dbg(PCIE, "Enter\n");
+@@ -938,6 +941,9 @@ static irqreturn_t brcmf_pcie_isr_thread(int irq, void *arg)
+ 	struct brcmf_pciedev_info *devinfo = (struct brcmf_pciedev_info *)arg;
+ 	u32 status;
+ 
++	if (READ_ONCE(devinfo->state) != BRCMFMAC_PCIE_STATE_UP)
++		return IRQ_NONE;
++
+ 	devinfo->in_irq = true;
+ 	status = brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->mailboxint);
+ 	brcmf_dbg(PCIE, "Enter %x\n", status);
+@@ -947,14 +953,15 @@ static irqreturn_t brcmf_pcie_isr_thread(int irq, void *arg)
+ 		if (status & devinfo->reginfo->int_fn0)
+ 			brcmf_pcie_handle_mb_data(devinfo);
+ 		if (status & devinfo->reginfo->int_d2h_db) {
+-			if (devinfo->state == BRCMFMAC_PCIE_STATE_UP)
++			if (READ_ONCE(devinfo->state) == BRCMFMAC_PCIE_STATE_UP)
+ 				brcmf_proto_msgbuf_rx_trigger(
+ 							&devinfo->pdev->dev);
+ 		}
+ 	}
+-	brcmf_pcie_bus_console_read(devinfo, false);
+-	if (devinfo->state == BRCMFMAC_PCIE_STATE_UP)
++	if (READ_ONCE(devinfo->state) == BRCMFMAC_PCIE_STATE_UP) {
++		brcmf_pcie_bus_console_read(devinfo, false);
+ 		brcmf_pcie_intr_enable(devinfo);
++	}
+ 	devinfo->in_irq = false;
+ 	return IRQ_HANDLED;
+ }
+@@ -977,7 +984,8 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
+ 	if (request_threaded_irq(pdev->irq, brcmf_pcie_quick_check_isr,
+ 				 brcmf_pcie_isr_thread, IRQF_SHARED,
+ 				 "brcmf_pcie_intr", devinfo)) {
+-		pci_disable_msi(pdev);
++		if (pdev->msi_enabled)
++			pci_disable_msi(pdev);
+ 		brcmf_err(bus, "Failed to request IRQ %d\n", pdev->irq);
+ 		return -EIO;
+ 	}
+@@ -996,9 +1004,11 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
+ 	if (!devinfo->irq_allocated)
+ 		return;
+ 
++	WRITE_ONCE(devinfo->state, BRCMFMAC_PCIE_STATE_DOWN);
+ 	brcmf_pcie_intr_disable(devinfo);
+ 	free_irq(pdev->irq, devinfo);
+-	pci_disable_msi(pdev);
++	if (pdev->msi_enabled)
++		pci_disable_msi(pdev);
+ 
+ 	msleep(50);
+ 	count = 0;
+@@ -2563,12 +2573,16 @@ brcmf_pcie_remove(struct pci_dev *pdev)
+ 	brcmf_pcie_bus_console_read(devinfo, false);
+ 	brcmf_pcie_fwcon_timer(devinfo, false);
+ 
+-	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
++	WRITE_ONCE(devinfo->state, BRCMFMAC_PCIE_STATE_DOWN);
+ 	if (devinfo->ci)
+ 		brcmf_pcie_intr_disable(devinfo);
+ 
+-	if (devinfo->irq_allocated)
+-		synchronize_irq(pdev->irq);
++	/*
++	 * Release and drain both the hardirq and threaded ISR BEFORE freeing
++	 * bus/msgbuf or releasing PCIe BAR resources so no in-flight IRQ can
++	 * touch freed memory or unmapped MMIO.
++	 */
++	brcmf_pcie_release_irq(devinfo);
+ 
+ 	brcmf_bus_cancel_reset_work(bus);
+ 
+@@ -2580,7 +2594,6 @@ brcmf_pcie_remove(struct pci_dev *pdev)
+ 	kfree(bus->msgbuf);
+ 	kfree(bus);
+ 
+-	brcmf_pcie_release_irq(devinfo);
+ 	brcmf_pcie_release_scratchbuffers(devinfo);
+ 	brcmf_pcie_release_ringbuffers(devinfo);
+ 	brcmf_pcie_reset_device(devinfo);
+diff --git a/drivers/pci/controller/dwc/pci-exynos.c b/drivers/pci/controller/dwc/pci-exynos.c
+index d47d7aaad..6b576ad5a 100644
+--- a/drivers/pci/controller/dwc/pci-exynos.c
++++ b/drivers/pci/controller/dwc/pci-exynos.c
+@@ -66,6 +66,7 @@ struct exynos_pcie {
+ 	struct phy			*phy;
+ 	struct gpio_desc		*perst;
+ 	bool				is_exynos990;
++	bool				clks_enabled;
+ 	struct regulator_bulk_data	supplies[2];
+ };
+ 
+@@ -104,6 +105,8 @@ static void exynos990_pcie_enable_clocks(struct exynos_pcie *ep)
+ 	exynos990_hsi1_gate(ep, HSI1_PCIE_CTRL_APB_GATE);
+ 	exynos990_hsi1_gate(ep, HSI1_PCIE_PCS_APB_GATE);
+ 	exynos990_hsi1_gate(ep, HSI1_PCIE_SLV_GATE);
++	smp_wmb();
++	ep->clks_enabled = true;
+ }
+ 
+ static void exynos990_pcie_phy_init(struct exynos_pcie *ep)
+@@ -273,10 +276,31 @@ static irqreturn_t exynos_pcie_irq_handler(int irq, void *arg)
+ {
+ 	struct exynos_pcie *ep = arg;
+ 
++	if (!READ_ONCE(ep->clks_enabled))
++		return IRQ_NONE;
++
+ 	exynos_pcie_clear_irq_pulse(ep);
+ 	return IRQ_HANDLED;
+ }
+ 
++static void exynos_pcie_disable_irq_pulse(struct exynos_pcie *ep)
++{
++	if (!READ_ONCE(ep->clks_enabled))
++		return;
++	exynos_pcie_writel(ep->elbi_base, 0, PCIE_IRQ_EN_PULSE);
++	exynos_pcie_writel(ep->elbi_base, 0, PCIE_IRQ_EN_LEVEL);
++	exynos_pcie_writel(ep->elbi_base, 0, PCIE_IRQ_EN_SPECIAL);
++}
++
++static void exynos_pcie_quiesce_irq(struct exynos_pcie *ep)
++{
++	exynos_pcie_disable_irq_pulse(ep);
++	WRITE_ONCE(ep->clks_enabled, false);
++	smp_wmb();
++	if (ep->pci.pp.irq > 0)
++		synchronize_irq(ep->pci.pp.irq);
++}
++
+ static void exynos_pcie_enable_irq_pulse(struct exynos_pcie *ep)
+ {
+ 	u32 val = IRQ_INTA_ASSERT | IRQ_INTB_ASSERT |
+@@ -285,6 +309,8 @@ static void exynos_pcie_enable_irq_pulse(struct exynos_pcie *ep)
+ 	exynos_pcie_writel(ep->elbi_base, val, PCIE_IRQ_EN_PULSE);
+ 	exynos_pcie_writel(ep->elbi_base, 0, PCIE_IRQ_EN_LEVEL);
+ 	exynos_pcie_writel(ep->elbi_base, 0, PCIE_IRQ_EN_SPECIAL);
++	smp_wmb();
++	WRITE_ONCE(ep->clks_enabled, true);
+ }
+ 
+ static u32 exynos_pcie_read_dbi(struct dw_pcie *pci, void __iomem *base,
+@@ -514,21 +540,35 @@ static void exynos_pcie_remove(struct platform_device *pdev)
+ {
+ 	struct exynos_pcie *ep = platform_get_drvdata(pdev);
+ 
++	exynos_pcie_quiesce_irq(ep);
+ 	dw_pcie_host_deinit(&ep->pci.pp);
+ 	exynos_pcie_assert_core_reset(ep);
+-	phy_power_off(ep->phy);
+-	phy_exit(ep->phy);
+-	regulator_bulk_disable(ARRAY_SIZE(ep->supplies), ep->supplies);
++	if (!ep->is_exynos990) {
++		phy_power_off(ep->phy);
++		phy_exit(ep->phy);
++		regulator_bulk_disable(ARRAY_SIZE(ep->supplies), ep->supplies);
++	}
++}
++
++static void exynos_pcie_shutdown(struct platform_device *pdev)
++{
++	struct exynos_pcie *ep = platform_get_drvdata(pdev);
++
++	if (ep)
++		exynos_pcie_quiesce_irq(ep);
+ }
+ 
+ static int exynos_pcie_suspend_noirq(struct device *dev)
+ {
+ 	struct exynos_pcie *ep = dev_get_drvdata(dev);
+ 
++	exynos_pcie_quiesce_irq(ep);
+ 	exynos_pcie_assert_core_reset(ep);
+-	phy_power_off(ep->phy);
+-	phy_exit(ep->phy);
+-	regulator_bulk_disable(ARRAY_SIZE(ep->supplies), ep->supplies);
++	if (!ep->is_exynos990) {
++		phy_power_off(ep->phy);
++		phy_exit(ep->phy);
++		regulator_bulk_disable(ARRAY_SIZE(ep->supplies), ep->supplies);
++	}
+ 
+ 	return 0;
+ }
+@@ -540,9 +580,12 @@ static int exynos_pcie_resume_noirq(struct device *dev)
+ 	struct dw_pcie_rp *pp = &pci->pp;
+ 	int ret;
+ 
+-	ret = regulator_bulk_enable(ARRAY_SIZE(ep->supplies), ep->supplies);
+-	if (ret)
+-		return ret;
++	if (!ep->is_exynos990) {
++		ret = regulator_bulk_enable(ARRAY_SIZE(ep->supplies),
++					    ep->supplies);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/* exynos_pcie_host_init controls ep->phy */
+ 	exynos_pcie_host_init(pp);
+@@ -565,6 +608,7 @@ static const struct of_device_id exynos_pcie_of_match[] = {
+ static struct platform_driver exynos_pcie_driver = {
+ 	.probe		= exynos_pcie_probe,
+ 	.remove_new	= exynos_pcie_remove,
++	.shutdown	= exynos_pcie_shutdown,
+ 	.driver = {
+ 		.name	= "exynos-pcie",
+ 		.of_match_table = exynos_pcie_of_match,
+-- 
+2.56.1
+

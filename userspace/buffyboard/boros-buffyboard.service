@@ -1,0 +1,40 @@
+[Unit]
+Description=BOROS Framebuffer On-Screen Keyboard (buffyboard)
+ConditionKernelVersion=6.12.119-g970959bbf675
+ConditionPathExists=/dev/fb0
+ConditionPathExists=/dev/uinput
+ConditionPathExists=/dev/input/boros-touch
+After=boros-touch.service boros-uinput.service getty@tty1.service
+Wants=boros-touch.service boros-uinput.service
+
+[Service]
+Type=simple
+User=buffyboard
+Group=buffyboard
+# Only video (fb0) and tty (KDFONTOP GET / TIOCSWINSZ on VT); NO broad 'input' group.
+# /dev/uinput is a system-wide synthetic input capability, restricted to root:buffyboard (0660, no uaccess).
+SupplementaryGroups=video tty
+ExecStart=/usr/bin/buffyboard
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+
+# Hardening & measured resource bounds (observed peak: 2.4 MiB)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+DevicePolicy=closed
+DeviceAllow=/dev/fb0 rw
+DeviceAllow=/dev/uinput rw
+DeviceAllow=/dev/tty0 rw
+DeviceAllow=/dev/tty1 rw
+DeviceAllow=/dev/input/boros-touch rw
+MemoryAccounting=yes
+MemoryMax=32M
+CPUAccounting=yes
+
+[Install]
+WantedBy=multi-user.target

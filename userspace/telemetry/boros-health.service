@@ -1,0 +1,17 @@
+[Unit]
+Description=BOROS Lightweight Hardware Health & Thermal Check
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/bin/boros-telemetry --check --state-file /run/boros-health-state.json --write-state /run/boros-health.json
+SyslogIdentifier=boros-health
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run
+MemoryAccounting=yes
+MemoryMax=24M
+CPUAccounting=yes

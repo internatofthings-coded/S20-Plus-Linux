@@ -1,0 +1,54 @@
+From f7e0e461451a51e835eee9ad60f6e728b9a1380f Mon Sep 17 00:00:00 2001
+From: Boros Maintainer <boros@local>
+Date: Tue, 24 Nov 2026 06:44:03 +0800
+Subject: [PATCH 10/10] thermal: exynos990: tighten ACPM TMU response type/tzid
+ validation and 125C cap
+
+---
+ drivers/firmware/samsung/exynos-acpm-tmu.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/firmware/samsung/exynos-acpm-tmu.c b/drivers/firmware/samsung/exynos-acpm-tmu.c
+index c202b4c87..fbe720cef 100644
+--- a/drivers/firmware/samsung/exynos-acpm-tmu.c
++++ b/drivers/firmware/samsung/exynos-acpm-tmu.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Exynos990 ACPM TMU IPC client (read-only temperature telemetry).
++ * Exynos990 ACPM TMU IPC client (telemetry-only: INIT handshake + READ_TEMP).
++ * Never sends threshold, interrupt-enable, or TMU-control mutation commands.
+  *
+  * Message format verified against Samsung Exynos9830/990 GPL exynos_acpm_tmu.h:
+  *   REQ  cmd[1]: type (bits 7:0), tzid (bits 23:16)
+@@ -20,7 +21,8 @@
+ #define TMU_IPC_READ_TEMP	0x02
+ 
+ #define EXYNOS990_TMU_MAX_TZ	5
+-#define EXYNOS990_TMU_MAX_DEGC	135
++/* Reject 0x00 and >=0x7f (127/255) sentinel values; stock HW hot trip is 115 C */
++#define EXYNOS990_TMU_MAX_DEGC	125
+ 
+ int acpm_tmu_init(struct acpm_handle *handle, unsigned int acpm_chan_id)
+ {
+@@ -58,12 +60,16 @@ int acpm_tmu_read_temp(struct acpm_handle *handle, unsigned int acpm_chan_id,
+ 	if (ret)
+ 		return ret;
+ 
++	if (((xfer.rxd[1] & 0xff) != TMU_IPC_READ_TEMP) ||
++	    (((xfer.rxd[1] >> 16) & 0xff) != tz))
++		return -EIO;
++
+ 	resp_ret = (s8)((xfer.rxd[1] >> 8) & 0xff);
+ 	if (resp_ret < 0)
+ 		return -EIO;
+ 
+ 	raw_temp = (xfer.rxd[1] >> 24) & 0xff;
+-	/* Reject uninitialized (0 C) or implausible (>135 C) readings fail-safely */
++	/* Reject uninitialized (0 C) or sentinel/implausible (>125 C) readings */
+ 	if (raw_temp == 0 || raw_temp > EXYNOS990_TMU_MAX_DEGC)
+ 		return -EIO;
+ 
+-- 
+2.56.1
+

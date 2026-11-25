@@ -1,0 +1,29 @@
+# Build outputs
+/tui/target/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+*.dtb
+*.img
+*.cpio
+*.gz
+*.xz
+*.tar*
+__pycache__/
+*.pyc
+.DS_Store
+
+# Never commit secrets, keys, firmware blobs, or device dumps
+*.pem
+*.key
+*.pub
+*.bin
+*.fw
+*.nvram
+*efs*
+*imei*
+.env

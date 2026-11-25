@@ -1,0 +1,27 @@
+From f86eb169b135847cc8210e14921fa6a8b710073a Mon Sep 17 00:00:00 2001
+From: Boros Maintainer <boros@local>
+Date: Tue, 24 Nov 2026 05:32:38 +0800
+Subject: [PATCH 06/10] wifi: brcmfmac: download random seed before NVRAM on
+ BCM4375
+
+---
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index 7de1f9684..43ff1059b 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -1737,7 +1737,8 @@ static int brcmf_pcie_download_fw_nvram(struct brcmf_pciedev_info *devinfo,
+ 		memcpy_toio(devinfo->tcm + address, nvram, nvram_len);
+ 		brcmf_fw_nvram_free(nvram);
+ 
+-		if (devinfo->otp.valid) {
++		if (devinfo->otp.valid ||
++		    devinfo->pdev->device == BRCM_PCIE_4375_DEVICE_ID) {
+ 			size_t rand_len = BRCMF_RANDOM_SEED_LENGTH;
+ 			struct brcmf_random_seed_footer footer = {
+ 				.length = cpu_to_le32(rand_len),
+-- 
+2.56.1
+

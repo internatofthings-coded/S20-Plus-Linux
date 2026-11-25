@@ -1,0 +1,350 @@
+From 82d1532387a6f380e12479aa2f9b2ff8686b27d9 Mon Sep 17 00:00:00 2001
+From: Boros Maintainer <boros@local>
+Date: Tue, 24 Nov 2026 16:32:36 +0800
+Subject: [PATCH 11/13] firmware: samsung: exynos-acpm: serialize transfers,
+ fix seqnum masking/timeout recovery, and drain locks on shutdown
+
+---
+ drivers/firmware/samsung/exynos-acpm.c | 188 +++++++++++++++++++++----
+ 1 file changed, 162 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/firmware/samsung/exynos-acpm.c b/drivers/firmware/samsung/exynos-acpm.c
+index 895d81483..4639a80bd 100644
+--- a/drivers/firmware/samsung/exynos-acpm.c
++++ b/drivers/firmware/samsung/exynos-acpm.c
+@@ -28,6 +28,7 @@
+ #include <linux/mailbox/exynos-message.h>
+ #include <linux/mailbox_client.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/math.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -102,6 +103,7 @@ struct acpm_chan {
+ 	struct acpm_queue rx;
+ 	spinlock_t tx_lock;
+ 	spinlock_t rx_lock;
++	struct mutex xfer_lock;
+ 
+ 	unsigned int qlen;
+ 	unsigned int mlen;
+@@ -207,7 +209,7 @@ static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
+ 		val = readl(addr);
+ 
+ 		rx_seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, val);
+-		if (!rx_seqnum || rx_seqnum > ACPM_SEQNUM_MAX) {
++		if (!rx_seqnum || rx_seqnum >= ACPM_SEQNUM_MAX) {
+ 			ret = -EIO;
+ 			goto out_unlock;
+ 		}
+@@ -215,6 +217,20 @@ static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
+ 		seqnum = rx_seqnum - 1;
+ 		rx_data = &achan->rx_data[seqnum];
+ 
++		/*
++		 * Ignore late/orphan responses whose sequence number is no
++		 * longer in flight (e.g. after a previous transfer timed out),
++		 * so a delayed firmware response cannot corrupt subsequent
++		 * transactions.
++		 */
++		if (!test_bit(seqnum, achan->bitmap_seqnum)) {
++			dev_warn_ratelimited(achan->acpm->dev,
++					     "ACPM: dropping stale response ch:%u seq:%u\n",
++					     achan->id, rx_seqnum);
++			i = (i + 1) % achan->qlen;
++			continue;
++		}
++
+ 		if (rx_data->rxcnt) {
+ 			if (rx_seqnum == tx_seqnum) {
+ 				__ioread32_copy(xfer->rxd, addr, xfer->rxcnt);
+@@ -242,6 +258,30 @@ static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
+ 	return ret;
+ }
+ 
++static void acpm_drain_stale_rx(struct acpm_chan *achan, bool shutdown_path)
++{
++	unsigned long flags;
++	u32 rx_front, i;
++
++	if (achan->qlen <= 1)
++		return;
++
++	if (!acpm_spin_lock_acquire(&achan->rx_lock, &flags, shutdown_path))
++		return;
++
++	rx_front = readl(achan->rx.front);
++	i = readl(achan->rx.rear);
++	if (i != rx_front &&
++	    bitmap_empty(achan->bitmap_seqnum, ACPM_SEQNUM_MAX - 1)) {
++		dev_warn_ratelimited(achan->acpm->dev,
++				     "ACPM: flushing stale RX queue ch:%u (%u -> %u)\n",
++				     achan->id, i, rx_front);
++		writel(rx_front, achan->rx.rear);
++	}
++
++	spin_unlock_irqrestore(&achan->rx_lock, flags);
++}
++
+ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
+ 				   const struct acpm_xfer *xfer,
+ 				   bool shutdown_path)
+@@ -330,6 +370,7 @@ static int acpm_prepare_xfer(struct acpm_chan *achan,
+ 
+ 	/* Flag the index based on seqnum. (seqnum: 1~63, bitmap: 0~62) */
+ 	achan->seqnum = bit + 1;
++	txd[0] &= ~ACPM_PROTOCOL_SEQNUM;
+ 	txd[0] |= FIELD_PREP(ACPM_PROTOCOL_SEQNUM, achan->seqnum);
+ 
+ 	rx_data = &achan->rx_data[bit];
+@@ -348,11 +389,12 @@ static int acpm_wait_for_message_response(struct acpm_chan *achan,
+ }
+ 
+ static int acpm_wait_for_singleslot_response(struct acpm_chan *achan,
+-					     const struct acpm_xfer *xfer)
++					     const struct acpm_xfer *xfer,
++					     bool shutdown_path)
+ {
+ 	struct acpm_info *acpm = achan->acpm;
+ 	u32 seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->txd[0]);
+-	u32 val;
++	u32 rx_seqnum, val;
+ 	int ret;
+ 
+ 	if (!acpm->mbox_intr) {
+@@ -360,12 +402,39 @@ static int acpm_wait_for_singleslot_response(struct acpm_chan *achan,
+ 		return -ENODEV;
+ 	}
+ 
+-	ret = readl_poll_timeout_atomic(acpm->mbox_intr + ACPM_MBOX_INTSR1, val,
+-					val & (1u << achan->id), 20,
+-					ACPM_POLL_TIMEOUT_US);
+-	if (!ret && xfer->rxcnt && xfer->rxd)
+-		memcpy_fromio(xfer->rxd, achan->rx.base,
+-			      xfer->rxcnt * sizeof(*xfer->rxd));
++	for (;;) {
++		if (shutdown_path)
++			ret = readl_poll_timeout_atomic(
++				acpm->mbox_intr + ACPM_MBOX_INTSR1, val,
++				val & (1u << achan->id), 20,
++				ACPM_POLL_TIMEOUT_US);
++		else
++			ret = readl_poll_timeout(
++				acpm->mbox_intr + ACPM_MBOX_INTSR1, val,
++				val & (1u << achan->id), 20,
++				ACPM_POLL_TIMEOUT_US);
++
++		if (ret)
++			break;
++
++		rx_seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM,
++				      readl(achan->rx.base));
++		if (rx_seqnum >= ACPM_SEQNUM_MAX ||
++		    (rx_seqnum != seqnum &&
++		     (rx_seqnum != 0 || (xfer->rxcnt && xfer->rxd)))) {
++			dev_warn_ratelimited(acpm->dev,
++					     "ACPM: discarding delayed singleslot response ch:%u rx_seq:%u expected:%u\n",
++					     achan->id, rx_seqnum, seqnum);
++			writel(1u << achan->id,
++			       acpm->mbox_intr + ACPM_MBOX_INTCR1);
++			continue;
++		}
++
++		if (xfer->rxcnt && xfer->rxd)
++			memcpy_fromio(xfer->rxd, achan->rx.base,
++				      xfer->rxcnt * sizeof(*xfer->rxd));
++		break;
++	}
+ 
+ 	writel(1u << achan->id, acpm->mbox_intr + ACPM_MBOX_INTCR1);
+ 	clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
+@@ -403,12 +472,31 @@ static int __acpm_do_xfer(struct acpm_handle *handle,
+ 	msg.chan_id = xfer->acpm_chan_id;
+ 	msg.chan_type = EXYNOS_MBOX_CHAN_TYPE_DOORBELL;
+ 
+-	if (!acpm_spin_lock_acquire(&achan->tx_lock, &flags, shutdown_path))
+-		return -EBUSY;
++	/*
++	 * Serialize the full TX + response transaction per channel during
++	 * normal operation so single-slot (qlen == 1, e.g. ch 5 DVFS) SRAM
++	 * buffers and INTSR1/INTCR1 status bits cannot be overwritten or
++	 * raced by concurrent callers across clusters.
++	 */
++	if (!shutdown_path) {
++		mutex_lock(&achan->xfer_lock);
++		if (atomic_read(&acpm->shutting_down)) {
++			mutex_unlock(&achan->xfer_lock);
++			return -ESHUTDOWN;
++		}
++	}
++
++	acpm_drain_stale_rx(achan, shutdown_path);
++
++	if (!acpm_spin_lock_acquire(&achan->tx_lock, &flags, shutdown_path)) {
++		ret = -EBUSY;
++		goto out_xfer_unlock;
++	}
+ 
+ 	if (!shutdown_path && atomic_read(&acpm->shutting_down)) {
+ 		spin_unlock_irqrestore(&achan->tx_lock, flags);
+-		return -ESHUTDOWN;
++		ret = -ESHUTDOWN;
++		goto out_xfer_unlock;
+ 	}
+ 
+ 	tx_front = readl(achan->tx.front);
+@@ -418,17 +506,25 @@ static int __acpm_do_xfer(struct acpm_handle *handle,
+ 		ret = acpm_wait_for_queue_slots(achan, idx);
+ 		if (ret) {
+ 			spin_unlock_irqrestore(&achan->tx_lock, flags);
+-			return ret;
++			goto out_xfer_unlock;
+ 		}
+ 	}
+ 
+ 	ret = acpm_prepare_xfer(achan, xfer);
+ 	if (ret) {
+ 		spin_unlock_irqrestore(&achan->tx_lock, flags);
+-		return ret;
++		goto out_xfer_unlock;
+ 	}
+ 	seqnum = achan->seqnum;
+ 
++	if (achan->qlen == 1) {
++		if (acpm->mbox_intr)
++			writel(1u << achan->id,
++			       acpm->mbox_intr + ACPM_MBOX_INTCR1);
++		if (achan->mlen >= sizeof(u32))
++			writel(0, achan->rx.base);
++	}
++
+ 	__iowrite32_copy(achan->tx.base + achan->mlen * tx_front,
+ 			 xfer->txd, xfer->txcnt);
+ 	writel(idx, achan->tx.front);
+@@ -437,16 +533,23 @@ static int __acpm_do_xfer(struct acpm_handle *handle,
+ 	if (ret < 0) {
+ 		clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
+ 		spin_unlock_irqrestore(&achan->tx_lock, flags);
+-		return ret;
++		goto out_xfer_unlock;
+ 	}
+ 
+ 	mbox_client_txdone(achan->chan, 0);
+ 	spin_unlock_irqrestore(&achan->tx_lock, flags);
+ 
+ 	if (achan->qlen == 1)
+-		return acpm_wait_for_singleslot_response(achan, xfer);
++		ret = acpm_wait_for_singleslot_response(achan, xfer,
++							shutdown_path);
++	else
++		ret = acpm_wait_for_message_response(achan, xfer,
++						     shutdown_path);
+ 
+-	return acpm_wait_for_message_response(achan, xfer, shutdown_path);
++out_xfer_unlock:
++	if (!shutdown_path)
++		mutex_unlock(&achan->xfer_lock);
++	return ret;
+ }
+ 
+ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
+@@ -570,6 +673,7 @@ static int acpm_channels_init(struct acpm_info *acpm)
+ 
+ 		spin_lock_init(&achan->rx_lock);
+ 		spin_lock_init(&achan->tx_lock);
++		mutex_init(&achan->xfer_lock);
+ 
+ 		cl->dev = dev;
+ 
+@@ -749,20 +853,24 @@ static int acpm_enter_wfi(struct acpm_info *acpm)
+ 
+ /*
+  * Runs in process context with IRQs enabled BEFORE migrate_to_reboot_cpu()
+- * and smp_send_stop(). Quiesces all non-shutdown ACPM callers and drains
+- * every channel's tx_lock and rx_lock so no stopped CPU can hold a lock
+- * when acpm_power_off_notify() runs in IRQ-disabled atomic context.
++ * and smp_send_stop(). Quiesces all non-shutdown ACPM callers on both
++ * power-off and reboot by setting shutting_down=1 and draining every
++ * channel's xfer_lock, tx_lock, and rx_lock (releasing each lock after
++ * draining so no mutex ownership is retained across shutdown stages).
+  */
+-static int acpm_power_off_prepare(struct sys_off_data *data)
++static int acpm_shutdown_prepare(struct acpm_info *acpm, const char *mode)
+ {
+-	struct acpm_info *acpm = data->cb_data;
+ 	unsigned long flags;
+ 	unsigned int i;
+ 
+-	atomic_set(&acpm->shutting_down, 1);
++	if (atomic_xchg(&acpm->shutting_down, 1))
++		return NOTIFY_DONE;
+ 	smp_mb();
+ 
+ 	for (i = 0; i < acpm->num_chans; i++) {
++		mutex_lock(&acpm->chans[i].xfer_lock);
++		mutex_unlock(&acpm->chans[i].xfer_lock);
++
+ 		spin_lock_irqsave(&acpm->chans[i].tx_lock, flags);
+ 		spin_unlock_irqrestore(&acpm->chans[i].tx_lock, flags);
+ 
+@@ -770,11 +878,29 @@ static int acpm_power_off_prepare(struct sys_off_data *data)
+ 		spin_unlock_irqrestore(&acpm->chans[i].rx_lock, flags);
+ 	}
+ 
+-	dev_info(acpm->dev, "ACPM: power-off prepare quiesced %u channels\n",
+-		 acpm->num_chans);
++	dev_info(acpm->dev, "ACPM: %s prepare quiesced %u channels\n",
++		 mode, acpm->num_chans);
+ 	return NOTIFY_DONE;
+ }
+ 
++static int acpm_power_off_prepare(struct sys_off_data *data)
++{
++	return acpm_shutdown_prepare(data->cb_data, "power-off");
++}
++
++static int acpm_restart_prepare(struct sys_off_data *data)
++{
++	return acpm_shutdown_prepare(data->cb_data, "restart");
++}
++
++static void acpm_plat_shutdown(struct platform_device *pdev)
++{
++	struct acpm_info *acpm = platform_get_drvdata(pdev);
++
++	if (acpm)
++		acpm_shutdown_prepare(acpm, "device-shutdown");
++}
++
+ static int acpm_power_off_notify(struct sys_off_data *data)
+ {
+ 	struct acpm_info *acpm = data->cb_data;
+@@ -872,6 +998,15 @@ static int acpm_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	if (match_data->manage_s2mps19_wtsr_smpl) {
++		ret = devm_register_sys_off_handler(dev,
++						    SYS_OFF_MODE_RESTART_PREPARE,
++						    SYS_OFF_PRIO_FIRMWARE,
++						    acpm_restart_prepare,
++						    acpm);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "Failed to register restart prepare handler.\n");
++
+ 		ret = devm_register_sys_off_handler(dev,
+ 						    SYS_OFF_MODE_POWER_OFF_PREPARE,
+ 						    SYS_OFF_PRIO_FIRMWARE,
+@@ -1007,7 +1142,8 @@ static const struct of_device_id acpm_match[] = {
+ MODULE_DEVICE_TABLE(of, acpm_match);
+ 
+ static struct platform_driver acpm_driver = {
+-	.probe	= acpm_probe,
++	.probe		= acpm_probe,
++	.shutdown	= acpm_plat_shutdown,
+ 	.driver	= {
+ 		.name = "exynos-acpm-protocol",
+ 		.of_match_table	= acpm_match,
+-- 
+2.56.1
+

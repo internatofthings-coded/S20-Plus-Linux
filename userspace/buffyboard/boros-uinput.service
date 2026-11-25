@@ -1,0 +1,14 @@
+[Unit]
+Description=BOROS uinput kernel module loader (Boot-052)
+ConditionKernelVersion=6.12.119-g970959bbf675
+Before=boros-buffyboard.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/modprobe uinput
+ExecStartPost=/usr/bin/udevadm settle --timeout=10
+TimeoutStartSec=15
+
+[Install]
+WantedBy=multi-user.target

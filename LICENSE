@@ -1,0 +1,21 @@
+# Licensing overview — draft
+
+This project contains material under multiple licenses. The applicable source-level license and upstream notices govern each component; this overview does not replace them.
+
+## Kernel material
+
+Linux as a whole is licensed under GPL-2.0-only. The included kernel patches and OLED module retain their existing SPDX identifiers, including GPL-2.0, GPL-2.0-only, ISC and GPL-2.0-only OR BSD-2-Clause where present. Preserve upstream copyright notices and comply with each applicable license. See [GPL-2.0 text](LICENSES/GPL-2.0-only.txt) and [Third-party notices](THIRD-PARTY-NOTICES.md).
+
+The complete upstream provenance and applicable license texts still need verification. No blanket relicensing of upstream work is intended.
+
+## Independently authored material
+
+MIT is proposed for original userspace, TUI, artwork, scripts and documentation, subject to explicit maintainer approval and verification of the right to license that material. [Proposed MIT text](LICENSES/MIT.txt). This proposal does not grant a new license on third-party material or establish that all material is independently authored.
+
+## External dependencies
+
+External dependencies retain their respective licenses. No proprietary firmware or compiled binaries are included. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+## No warranty
+
+THIS PROJECT IS EXPERIMENTAL AND IS PROVIDED AS IS, WITHOUT WARRANTY OF ANY KIND, TO THE EXTENT PERMITTED BY APPLICABLE LAW. USE IS AT YOUR OWN RISK. FLASHING OR OPERATING MODIFIED HARDWARE MAY CAUSE DATA LOSS, DEVICE DAMAGE OR BATTERY DEGRADATION. THE DISCLAIMERS AND CONDITIONS IN EACH APPLICABLE LICENSE REMAIN IN EFFECT.

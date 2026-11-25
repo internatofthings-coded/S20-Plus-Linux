@@ -1,0 +1,3530 @@
+From 700a80aae5fac5083d966a4e0d3e425d81e15551 Mon Sep 17 00:00:00 2001
+From: Boros Maintainer <boros@local>
+Date: Tue, 24 Nov 2026 04:29:46 +0800
+Subject: [PATCH 04/10] boros: add M8 R2 ACPM IPC, mailbox, cpufreq,
+ syscon-poweroff priority, and safety-hardened MAX77705 charger
+
+---
+ drivers/cpufreq/Kconfig.arm                   |    8 +
+ drivers/cpufreq/Makefile                      |    1 +
+ drivers/cpufreq/exynos990-cpufreq.c           |  178 +++
+ drivers/firmware/Kconfig                      |    1 +
+ drivers/firmware/Makefile                     |    1 +
+ drivers/firmware/samsung/Kconfig              |    8 +
+ drivers/firmware/samsung/Makefile             |    4 +
+ drivers/firmware/samsung/exynos-acpm-dvfs.c   |   68 ++
+ drivers/firmware/samsung/exynos-acpm-dvfs.h   |   16 +
+ drivers/firmware/samsung/exynos-acpm-pmic.c   |  268 +++++
+ drivers/firmware/samsung/exynos-acpm-pmic.h   |   35 +
+ drivers/firmware/samsung/exynos-acpm.c        | 1014 +++++++++++++++++
+ drivers/firmware/samsung/exynos-acpm.h        |   24 +
+ drivers/mailbox/Kconfig                       |    6 +
+ drivers/mailbox/Makefile                      |    1 +
+ drivers/mailbox/exynos-mailbox.c              |  186 +++
+ drivers/power/reset/syscon-poweroff.c         |    2 +-
+ drivers/power/supply/Kconfig                  |    7 +
+ drivers/power/supply/Makefile                 |    1 +
+ drivers/power/supply/max77705_charger.c       |  924 +++++++++++++++
+ drivers/power/supply/power_supply_sysfs.c     |    1 +
+ .../firmware/samsung/exynos-acpm-protocol.h   |   74 ++
+ include/linux/mailbox/exynos-message.h        |   19 +
+ include/linux/mfd/max77705-private.h          |  195 ++++
+ include/linux/power/max77705_charger.h        |  232 ++++
+ include/linux/power_supply.h                  |    1 +
+ 26 files changed, 3274 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/cpufreq/exynos990-cpufreq.c
+ create mode 100644 drivers/firmware/samsung/Kconfig
+ create mode 100644 drivers/firmware/samsung/Makefile
+ create mode 100644 drivers/firmware/samsung/exynos-acpm-dvfs.c
+ create mode 100644 drivers/firmware/samsung/exynos-acpm-dvfs.h
+ create mode 100644 drivers/firmware/samsung/exynos-acpm-pmic.c
+ create mode 100644 drivers/firmware/samsung/exynos-acpm-pmic.h
+ create mode 100644 drivers/firmware/samsung/exynos-acpm.c
+ create mode 100644 drivers/firmware/samsung/exynos-acpm.h
+ create mode 100644 drivers/mailbox/exynos-mailbox.c
+ create mode 100644 drivers/power/supply/max77705_charger.c
+ create mode 100644 include/linux/firmware/samsung/exynos-acpm-protocol.h
+ create mode 100644 include/linux/mailbox/exynos-message.h
+ create mode 100644 include/linux/mfd/max77705-private.h
+ create mode 100644 include/linux/power/max77705_charger.h
+
+diff --git a/drivers/cpufreq/Kconfig.arm b/drivers/cpufreq/Kconfig.arm
+index 71f4b612d..64d4a8f79 100644
+--- a/drivers/cpufreq/Kconfig.arm
++++ b/drivers/cpufreq/Kconfig.arm
+@@ -270,3 +270,11 @@ config ARM_PXA2xx_CPUFREQ
+ 	  This add the CPUFreq driver support for Intel PXA2xx SOCs.
+ 
+ 	  If in doubt, say N.
++
++config ARM_EXYNOS990_CPUFREQ
++	tristate "Samsung Exynos 990 ACPM CPUFreq driver"
++	depends on ARCH_EXYNOS && EXYNOS_ACPM_PROTOCOL
++	default y
++	help
++	  This adds the CPUFreq driver for Samsung Exynos 990 SoC clusters
++	  (LITTLE Cortex-A55, MID Cortex-A76, BIG Exynos M5) via ACPM DVFS IPC.
+diff --git a/drivers/cpufreq/Makefile b/drivers/cpufreq/Makefile
+index 0f184031d..2a7d021c7 100644
+--- a/drivers/cpufreq/Makefile
++++ b/drivers/cpufreq/Makefile
+@@ -85,6 +85,7 @@ obj-$(CONFIG_ARM_TEGRA186_CPUFREQ)	+= tegra186-cpufreq.o
+ obj-$(CONFIG_ARM_TEGRA194_CPUFREQ)	+= tegra194-cpufreq.o
+ obj-$(CONFIG_ARM_TI_CPUFREQ)		+= ti-cpufreq.o
+ obj-$(CONFIG_ARM_VEXPRESS_SPC_CPUFREQ)	+= vexpress-spc-cpufreq.o
++obj-$(CONFIG_ARM_EXYNOS990_CPUFREQ)	+= exynos990-cpufreq.o
+ 
+ 
+ ##################################################################################
+diff --git a/drivers/cpufreq/exynos990-cpufreq.c b/drivers/cpufreq/exynos990-cpufreq.c
+new file mode 100644
+index 000000000..4dfd44e33
+--- /dev/null
++++ b/drivers/cpufreq/exynos990-cpufreq.c
+@@ -0,0 +1,178 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Exynos990 ACPM cpufreq driver (z3s).
++ *
++ * Drives the three CPU clusters (CPUCL0/1/2) via the ACPM DVFS channel.
++ * ACPM performs the matching voltage transition, so the driver only requests
++ * frequencies. get_rate is not reliable on this firmware, so .get returns the
++ * cached target. Built as a module for iteration.
++ */
++#include <linux/cpu.h>
++#include <linux/cpufreq.h>
++#include <linux/err.h>
++#include <linux/firmware/samsung/exynos-acpm-protocol.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/units.h>
++
++#define ACPM_DVFS_CHANNEL	5
++
++struct z3s_cluster {
++	unsigned int acpm_id;		/* CPUCL0=2, CPUCL1=3, CPUCL2=4 */
++	unsigned int first_cpu;
++	unsigned int last_cpu;
++	const unsigned int *khz;	/* ascending frequency table (kHz) */
++	unsigned int n;
++	unsigned int cur_khz;
++};
++
++static const unsigned int cl0_khz[] = {
++	442000, 650000, 858000, 1066000, 1274000, 1482000, 1690000, 1898000, 2002000
++};
++static const unsigned int cl1_khz[] = {
++	507000, 693000, 862000, 1063000, 1264000, 1466000, 1670000, 1872000,
++	2074000, 2276000, 2478000, 2600000
++};
++static const unsigned int cl2_khz[] = {
++	546000, 754000, 1014000, 1248000, 1456000, 1690000, 1898000, 2106000,
++	2340000, 2548000, 2730000
++};
++
++static struct z3s_cluster clusters[] = {
++	{ 2, 0, 3, cl0_khz, ARRAY_SIZE(cl0_khz), 0 },
++	{ 3, 4, 5, cl1_khz, ARRAY_SIZE(cl1_khz), 0 },
++	{ 4, 6, 7, cl2_khz, ARRAY_SIZE(cl2_khz), 0 },
++};
++
++static struct acpm_handle *z3s_acpm;
++static struct platform_device *z3s_pdev;
++
++static struct z3s_cluster *cluster_for_cpu(unsigned int cpu)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(clusters); i++)
++		if (cpu >= clusters[i].first_cpu && cpu <= clusters[i].last_cpu)
++			return &clusters[i];
++	return NULL;
++}
++
++static int z3s_target_index(struct cpufreq_policy *policy, unsigned int index)
++{
++	struct z3s_cluster *cl = policy->driver_data;
++	unsigned int khz = policy->freq_table[index].frequency;
++	int ret;
++
++	ret = z3s_acpm->ops->dvfs.set_rate(z3s_acpm, ACPM_DVFS_CHANNEL,
++					   cl->acpm_id,
++					   (unsigned long)khz * HZ_PER_KHZ);
++	if (!ret)
++		cl->cur_khz = khz;
++	return ret;
++}
++
++static unsigned int z3s_get(unsigned int cpu)
++{
++	struct z3s_cluster *cl = cluster_for_cpu(cpu);
++
++	if (!cl)
++		return 0;
++	return cl->cur_khz ? cl->cur_khz : cl->khz[cl->n - 1];
++}
++
++static int z3s_cpufreq_init(struct cpufreq_policy *policy)
++{
++	struct z3s_cluster *cl = cluster_for_cpu(policy->cpu);
++	struct cpufreq_frequency_table *ft;
++	unsigned int i, cpu;
++
++	if (!cl)
++		return -ENODEV;
++
++	ft = kcalloc(cl->n + 1, sizeof(*ft), GFP_KERNEL);
++	if (!ft)
++		return -ENOMEM;
++	for (i = 0; i < cl->n; i++)
++		ft[i].frequency = cl->khz[i];
++	ft[cl->n].frequency = CPUFREQ_TABLE_END;
++
++	/* claim all online siblings in this cluster */
++	for (cpu = cl->first_cpu; cpu <= cl->last_cpu; cpu++)
++		if (cpu_possible(cpu))
++			cpumask_set_cpu(cpu, policy->cpus);
++
++	policy->freq_table = ft;
++	policy->driver_data = cl;
++	policy->cpuinfo.transition_latency = 2 * NSEC_PER_MSEC;
++
++	/* seed the cache with the top OPP so .get is sane before first switch */
++	if (!cl->cur_khz)
++		cl->cur_khz = cl->khz[cl->n - 1];
++
++	return 0;
++}
++
++static void z3s_cpufreq_exit(struct cpufreq_policy *policy)
++{
++	kfree(policy->freq_table);
++}
++
++static struct cpufreq_driver z3s_cpufreq_driver = {
++	.name		= "exynos990-acpm",
++	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK |
++			  CPUFREQ_HAVE_GOVERNOR_PER_POLICY,
++	.verify		= cpufreq_generic_frequency_table_verify,
++	.target_index	= z3s_target_index,
++	.get		= z3s_get,
++	.init		= z3s_cpufreq_init,
++	.exit		= z3s_cpufreq_exit,
++	.attr		= cpufreq_generic_attr,
++};
++
++static int __init z3s_cpufreq_module_init(void)
++{
++	struct device_node *np;
++	int ret;
++
++	z3s_pdev = platform_device_register_simple("exynos990-cpufreq",
++						   PLATFORM_DEVID_NONE, NULL, 0);
++	if (IS_ERR(z3s_pdev))
++		return PTR_ERR(z3s_pdev);
++
++	np = of_find_compatible_node(NULL, NULL, "samsung,exynos990-acpm-ipc");
++	if (!np) {
++		ret = -ENODEV;
++		goto err;
++	}
++	z3s_acpm = devm_acpm_get_by_node(&z3s_pdev->dev, np);
++	of_node_put(np);
++	if (IS_ERR(z3s_acpm)) {
++		ret = PTR_ERR(z3s_acpm);
++		goto err;
++	}
++
++	ret = cpufreq_register_driver(&z3s_cpufreq_driver);
++	if (ret)
++		goto err;
++
++	pr_info("exynos990-cpufreq: registered (ACPM DVFS ch %d)\n",
++		ACPM_DVFS_CHANNEL);
++	return 0;
++err:
++	platform_device_unregister(z3s_pdev);
++	return ret;
++}
++
++static void __exit z3s_cpufreq_module_exit(void)
++{
++	cpufreq_unregister_driver(&z3s_cpufreq_driver);
++	platform_device_unregister(z3s_pdev);
++}
++
++module_init(z3s_cpufreq_module_init);
++module_exit(z3s_cpufreq_module_exit);
++MODULE_DESCRIPTION("Exynos990 ACPM cpufreq driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/firmware/Kconfig b/drivers/firmware/Kconfig
+index f7044bf53..ac65027eb 100644
+--- a/drivers/firmware/Kconfig
++++ b/drivers/firmware/Kconfig
+@@ -266,6 +266,7 @@ source "drivers/firmware/meson/Kconfig"
+ source "drivers/firmware/microchip/Kconfig"
+ source "drivers/firmware/psci/Kconfig"
+ source "drivers/firmware/qcom/Kconfig"
++source "drivers/firmware/samsung/Kconfig"
+ source "drivers/firmware/smccc/Kconfig"
+ source "drivers/firmware/tegra/Kconfig"
+ source "drivers/firmware/xilinx/Kconfig"
+diff --git a/drivers/firmware/Makefile b/drivers/firmware/Makefile
+index 7a8d486e7..91efcc868 100644
+--- a/drivers/firmware/Makefile
++++ b/drivers/firmware/Makefile
+@@ -33,6 +33,7 @@ obj-y				+= efi/
+ obj-y				+= imx/
+ obj-y				+= psci/
+ obj-y				+= qcom/
++obj-y				+= samsung/
+ obj-y				+= smccc/
+ obj-y				+= tegra/
+ obj-y				+= xilinx/
+diff --git a/drivers/firmware/samsung/Kconfig b/drivers/firmware/samsung/Kconfig
+new file mode 100644
+index 000000000..226a0a39c
+--- /dev/null
++++ b/drivers/firmware/samsung/Kconfig
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config EXYNOS_ACPM_PROTOCOL
++	tristate "Exynos Alive Clock and Power Manager (ACPM) Message Protocol"
++	depends on ARCH_EXYNOS || COMPILE_TEST
++	depends on MAILBOX
++	help
++	  Alive Clock and Power Manager (ACPM) Message Protocol driver.
+diff --git a/drivers/firmware/samsung/Makefile b/drivers/firmware/samsung/Makefile
+new file mode 100644
+index 000000000..576b34a12
+--- /dev/null
++++ b/drivers/firmware/samsung/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++acpm-protocol-objs := exynos-acpm.o exynos-acpm-pmic.o exynos-acpm-dvfs.o
++obj-$(CONFIG_EXYNOS_ACPM_PROTOCOL) += acpm-protocol.o
+diff --git a/drivers/firmware/samsung/exynos-acpm-dvfs.c b/drivers/firmware/samsung/exynos-acpm-dvfs.c
+new file mode 100644
+index 000000000..f29dd0281
+--- /dev/null
++++ b/drivers/firmware/samsung/exynos-acpm-dvfs.c
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright 2020 Samsung Electronics Co., Ltd.
++ * Copyright 2020 Google LLC.
++ * Copyright 2025 Linaro Ltd.
++ */
++
++#include <linux/array_size.h>
++#include <linux/bitfield.h>
++#include <linux/firmware/samsung/exynos-acpm-protocol.h>
++#include <linux/ktime.h>
++#include <linux/types.h>
++#include <linux/units.h>
++
++#include "exynos-acpm.h"
++#include "exynos-acpm-dvfs.h"
++
++#define ACPM_DVFS_ID			GENMASK(11, 0)
++#define ACPM_DVFS_REQ_TYPE		GENMASK(15, 0)
++
++#define ACPM_DVFS_FREQ_REQ		0
++#define ACPM_DVFS_FREQ_GET		1
++
++static void acpm_dvfs_init_set_rate_cmd(u32 cmd[4], unsigned int clk_id,
++					unsigned long rate)
++{
++	cmd[0] = FIELD_PREP(ACPM_DVFS_ID, clk_id);
++	cmd[1] = rate / HZ_PER_KHZ;
++	cmd[2] = FIELD_PREP(ACPM_DVFS_REQ_TYPE, ACPM_DVFS_FREQ_REQ);
++	cmd[3] = 0; /* z3s: exynos990 expects 0, not gs101 timestamp */
++}
++
++int acpm_dvfs_set_rate(struct acpm_handle *handle,
++		       unsigned int acpm_chan_id, unsigned int clk_id,
++		       unsigned long rate)
++{
++	struct acpm_xfer xfer = {0};
++	u32 cmd[4];
++
++	acpm_dvfs_init_set_rate_cmd(cmd, clk_id, rate);
++	acpm_set_xfer(&xfer, cmd, ARRAY_SIZE(cmd), acpm_chan_id, false);
++
++	return acpm_do_xfer(handle, &xfer);
++}
++
++static void acpm_dvfs_init_get_rate_cmd(u32 cmd[4], unsigned int clk_id)
++{
++	cmd[0] = FIELD_PREP(ACPM_DVFS_ID, clk_id);
++	cmd[2] = FIELD_PREP(ACPM_DVFS_REQ_TYPE, ACPM_DVFS_FREQ_GET);
++	cmd[3] = 0; /* z3s: exynos990 expects 0, not gs101 timestamp */
++}
++
++unsigned long acpm_dvfs_get_rate(struct acpm_handle *handle,
++				 unsigned int acpm_chan_id, unsigned int clk_id)
++{
++	struct acpm_xfer xfer;
++	unsigned int cmd[4] = {0};
++	int ret;
++
++	acpm_dvfs_init_get_rate_cmd(cmd, clk_id);
++	acpm_set_xfer(&xfer, cmd, ARRAY_SIZE(cmd), acpm_chan_id, true);
++
++	ret = acpm_do_xfer(handle, &xfer);
++	if (ret)
++		return 0;
++
++	return xfer.rxd[1] * HZ_PER_KHZ;
++}
+diff --git a/drivers/firmware/samsung/exynos-acpm-dvfs.h b/drivers/firmware/samsung/exynos-acpm-dvfs.h
+new file mode 100644
+index 000000000..aff0e6755
+--- /dev/null
++++ b/drivers/firmware/samsung/exynos-acpm-dvfs.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __EXYNOS_ACPM_DVFS_H__
++#define __EXYNOS_ACPM_DVFS_H__
++
++#include <linux/types.h>
++
++struct acpm_handle;
++
++int acpm_dvfs_set_rate(struct acpm_handle *handle,
++		       unsigned int acpm_chan_id, unsigned int clk_id,
++		       unsigned long rate);
++unsigned long acpm_dvfs_get_rate(struct acpm_handle *handle,
++				 unsigned int acpm_chan_id,
++				 unsigned int clk_id);
++
++#endif /* __EXYNOS_ACPM_DVFS_H__ */
+diff --git a/drivers/firmware/samsung/exynos-acpm-pmic.c b/drivers/firmware/samsung/exynos-acpm-pmic.c
+new file mode 100644
+index 000000000..ba7d62757
+--- /dev/null
++++ b/drivers/firmware/samsung/exynos-acpm-pmic.c
+@@ -0,0 +1,268 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright 2020 Samsung Electronics Co., Ltd.
++ * Copyright 2020 Google LLC.
++ * Copyright 2024 Linaro Ltd.
++ *
++ * Boot-042 R2: Use ktime_get_mono_fast_ns() for atomic/shutdown-safe PMIC
++ * IPC timestamps and expose acpm_pmic_read_reg_shutdown() /
++ * acpm_pmic_write_reg_shutdown() for the quiesced power-off path.
++ */
++#include <linux/bitfield.h>
++#include <linux/firmware/samsung/exynos-acpm-protocol.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
++#include <linux/types.h>
++
++#include "exynos-acpm.h"
++#include "exynos-acpm-pmic.h"
++
++#define ACPM_PMIC_CHANNEL		GENMASK(15, 12)
++#define ACPM_PMIC_TYPE			GENMASK(11, 8)
++#define ACPM_PMIC_REG			GENMASK(7, 0)
++
++#define ACPM_PMIC_RETURN		GENMASK(31, 24)
++#define ACPM_PMIC_MASK			GENMASK(23, 16)
++#define ACPM_PMIC_VALUE			GENMASK(15, 8)
++#define ACPM_PMIC_FUNC			GENMASK(7, 0)
++
++#define ACPM_PMIC_BULK_SHIFT		8
++#define ACPM_PMIC_BULK_MASK		GENMASK(7, 0)
++#define ACPM_PMIC_BULK_MAX_COUNT	8
++
++enum exynos_acpm_pmic_func {
++	ACPM_PMIC_READ,
++	ACPM_PMIC_WRITE,
++	ACPM_PMIC_UPDATE,
++	ACPM_PMIC_BULK_READ,
++	ACPM_PMIC_BULK_WRITE,
++};
++
++static inline u32 acpm_pmic_timestamp_ms(void)
++{
++	return (u32)div_u64(ktime_get_mono_fast_ns(), NSEC_PER_MSEC);
++}
++
++static inline u32 acpm_pmic_set_bulk(u32 data, unsigned int i)
++{
++	return (data & ACPM_PMIC_BULK_MASK) << (ACPM_PMIC_BULK_SHIFT * i);
++}
++
++static inline u32 acpm_pmic_get_bulk(u32 data, unsigned int i)
++{
++	return (data >> (ACPM_PMIC_BULK_SHIFT * i)) & ACPM_PMIC_BULK_MASK;
++}
++
++static void acpm_pmic_set_xfer(struct acpm_xfer *xfer, u32 *cmd,
++			       unsigned int acpm_chan_id)
++{
++	xfer->txd = cmd;
++	xfer->rxd = cmd;
++	xfer->txcnt = 4;
++	xfer->rxcnt = 4;
++	xfer->acpm_chan_id = acpm_chan_id;
++}
++
++static void acpm_pmic_init_read_cmd(u32 cmd[4], u8 type, u8 reg, u8 chan)
++{
++	cmd[0] = FIELD_PREP(ACPM_PMIC_TYPE, type) |
++		 FIELD_PREP(ACPM_PMIC_REG, reg) |
++		 FIELD_PREP(ACPM_PMIC_CHANNEL, chan);
++	cmd[1] = FIELD_PREP(ACPM_PMIC_FUNC, ACPM_PMIC_READ);
++	cmd[3] = acpm_pmic_timestamp_ms();
++}
++
++static int __acpm_pmic_read_reg(struct acpm_handle *handle,
++				unsigned int acpm_chan_id, u8 type, u8 reg,
++				u8 chan, u8 *buf, bool shutdown_path)
++{
++	struct acpm_xfer xfer;
++	u32 cmd[4] = {0};
++	int ret;
++
++	acpm_pmic_init_read_cmd(cmd, type, reg, chan);
++	acpm_pmic_set_xfer(&xfer, cmd, acpm_chan_id);
++
++	ret = shutdown_path ? acpm_do_xfer_shutdown(handle, &xfer)
++			    : acpm_do_xfer(handle, &xfer);
++	if (ret)
++		return ret;
++
++	*buf = FIELD_GET(ACPM_PMIC_VALUE, xfer.rxd[1]);
++
++	return FIELD_GET(ACPM_PMIC_RETURN, xfer.rxd[1]);
++}
++
++int acpm_pmic_read_reg(struct acpm_handle *handle,
++		       unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++		       u8 *buf)
++{
++	return __acpm_pmic_read_reg(handle, acpm_chan_id, type, reg, chan, buf,
++				    false);
++}
++
++int acpm_pmic_read_reg_shutdown(struct acpm_handle *handle,
++				unsigned int acpm_chan_id, u8 type, u8 reg,
++				u8 chan, u8 *buf)
++{
++	return __acpm_pmic_read_reg(handle, acpm_chan_id, type, reg, chan, buf,
++				    true);
++}
++
++static void acpm_pmic_init_bulk_read_cmd(u32 cmd[4], u8 type, u8 reg, u8 chan,
++					 u8 count)
++{
++	cmd[0] = FIELD_PREP(ACPM_PMIC_TYPE, type) |
++		 FIELD_PREP(ACPM_PMIC_REG, reg) |
++		 FIELD_PREP(ACPM_PMIC_CHANNEL, chan);
++	cmd[1] = FIELD_PREP(ACPM_PMIC_FUNC, ACPM_PMIC_BULK_READ) |
++		 FIELD_PREP(ACPM_PMIC_VALUE, count);
++}
++
++int acpm_pmic_bulk_read(struct acpm_handle *handle,
++			unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			u8 count, u8 *buf)
++{
++	struct acpm_xfer xfer;
++	u32 cmd[4] = {0};
++	int i, ret;
++
++	if (count > ACPM_PMIC_BULK_MAX_COUNT)
++		return -EINVAL;
++
++	acpm_pmic_init_bulk_read_cmd(cmd, type, reg, chan, count);
++	acpm_pmic_set_xfer(&xfer, cmd, acpm_chan_id);
++
++	ret = acpm_do_xfer(handle, &xfer);
++	if (ret)
++		return ret;
++
++	ret = FIELD_GET(ACPM_PMIC_RETURN, xfer.rxd[1]);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < count; i++) {
++		if (i < 4)
++			buf[i] = acpm_pmic_get_bulk(xfer.rxd[2], i);
++		else
++			buf[i] = acpm_pmic_get_bulk(xfer.rxd[3], i - 4);
++	}
++
++	return 0;
++}
++
++static void acpm_pmic_init_write_cmd(u32 cmd[4], u8 type, u8 reg, u8 chan,
++				     u8 value)
++{
++	cmd[0] = FIELD_PREP(ACPM_PMIC_TYPE, type) |
++		 FIELD_PREP(ACPM_PMIC_REG, reg) |
++		 FIELD_PREP(ACPM_PMIC_CHANNEL, chan);
++	cmd[1] = FIELD_PREP(ACPM_PMIC_FUNC, ACPM_PMIC_WRITE) |
++		 FIELD_PREP(ACPM_PMIC_VALUE, value);
++	cmd[3] = acpm_pmic_timestamp_ms();
++}
++
++static int __acpm_pmic_write_reg(struct acpm_handle *handle,
++				 unsigned int acpm_chan_id, u8 type, u8 reg,
++				 u8 chan, u8 value, bool shutdown_path)
++{
++	struct acpm_xfer xfer;
++	u32 cmd[4] = {0};
++	int ret;
++
++	acpm_pmic_init_write_cmd(cmd, type, reg, chan, value);
++	acpm_pmic_set_xfer(&xfer, cmd, acpm_chan_id);
++
++	ret = shutdown_path ? acpm_do_xfer_shutdown(handle, &xfer)
++			    : acpm_do_xfer(handle, &xfer);
++	if (ret)
++		return ret;
++
++	return FIELD_GET(ACPM_PMIC_RETURN, xfer.rxd[1]);
++}
++
++int acpm_pmic_write_reg(struct acpm_handle *handle,
++			unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			u8 value)
++{
++	return __acpm_pmic_write_reg(handle, acpm_chan_id, type, reg, chan,
++				     value, false);
++}
++
++int acpm_pmic_write_reg_shutdown(struct acpm_handle *handle,
++				 unsigned int acpm_chan_id, u8 type, u8 reg,
++				 u8 chan, u8 value)
++{
++	return __acpm_pmic_write_reg(handle, acpm_chan_id, type, reg, chan,
++				     value, true);
++}
++
++static void acpm_pmic_init_bulk_write_cmd(u32 cmd[4], u8 type, u8 reg, u8 chan,
++					  u8 count, const u8 *buf)
++{
++	int i;
++
++	cmd[0] = FIELD_PREP(ACPM_PMIC_TYPE, type) |
++		 FIELD_PREP(ACPM_PMIC_REG, reg) |
++		 FIELD_PREP(ACPM_PMIC_CHANNEL, chan);
++	cmd[1] = FIELD_PREP(ACPM_PMIC_FUNC, ACPM_PMIC_BULK_WRITE) |
++		 FIELD_PREP(ACPM_PMIC_VALUE, count);
++
++	for (i = 0; i < count; i++) {
++		if (i < 4)
++			cmd[2] |= acpm_pmic_set_bulk(buf[i], i);
++		else
++			cmd[3] |= acpm_pmic_set_bulk(buf[i], i - 4);
++	}
++}
++
++int acpm_pmic_bulk_write(struct acpm_handle *handle,
++			 unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			 u8 count, const u8 *buf)
++{
++	struct acpm_xfer xfer;
++	u32 cmd[4] = {0};
++	int ret;
++
++	if (count > ACPM_PMIC_BULK_MAX_COUNT)
++		return -EINVAL;
++
++	acpm_pmic_init_bulk_write_cmd(cmd, type, reg, chan, count, buf);
++	acpm_pmic_set_xfer(&xfer, cmd, acpm_chan_id);
++
++	ret = acpm_do_xfer(handle, &xfer);
++	if (ret)
++		return ret;
++
++	return FIELD_GET(ACPM_PMIC_RETURN, xfer.rxd[1]);
++}
++
++static void acpm_pmic_init_update_cmd(u32 cmd[4], u8 type, u8 reg, u8 chan,
++				      u8 value, u8 mask)
++{
++	cmd[0] = FIELD_PREP(ACPM_PMIC_TYPE, type) |
++		 FIELD_PREP(ACPM_PMIC_REG, reg) |
++		 FIELD_PREP(ACPM_PMIC_CHANNEL, chan);
++	cmd[1] = FIELD_PREP(ACPM_PMIC_FUNC, ACPM_PMIC_UPDATE) |
++		 FIELD_PREP(ACPM_PMIC_VALUE, value) |
++		 FIELD_PREP(ACPM_PMIC_MASK, mask);
++	cmd[3] = acpm_pmic_timestamp_ms();
++}
++
++int acpm_pmic_update_reg(struct acpm_handle *handle,
++			 unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			 u8 value, u8 mask)
++{
++	struct acpm_xfer xfer;
++	u32 cmd[4] = {0};
++	int ret;
++
++	acpm_pmic_init_update_cmd(cmd, type, reg, chan, value, mask);
++	acpm_pmic_set_xfer(&xfer, cmd, acpm_chan_id);
++
++	ret = acpm_do_xfer(handle, &xfer);
++	if (ret)
++		return ret;
++
++	return FIELD_GET(ACPM_PMIC_RETURN, xfer.rxd[1]);
++}
+diff --git a/drivers/firmware/samsung/exynos-acpm-pmic.h b/drivers/firmware/samsung/exynos-acpm-pmic.h
+new file mode 100644
+index 000000000..b3a49e4d7
+--- /dev/null
++++ b/drivers/firmware/samsung/exynos-acpm-pmic.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright 2020 Samsung Electronics Co., Ltd.
++ * Copyright 2020 Google LLC.
++ * Copyright 2024 Linaro Ltd.
++ */
++#ifndef __EXYNOS_ACPM_PMIC_H__
++#define __EXYNOS_ACPM_PMIC_H__
++
++#include <linux/types.h>
++
++struct acpm_handle;
++
++int acpm_pmic_read_reg(struct acpm_handle *handle,
++		       unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++		       u8 *buf);
++int acpm_pmic_bulk_read(struct acpm_handle *handle,
++			unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			u8 count, u8 *buf);
++int acpm_pmic_write_reg(struct acpm_handle *handle,
++			unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			u8 value);
++int acpm_pmic_bulk_write(struct acpm_handle *handle,
++			 unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			 u8 count, const u8 *buf);
++int acpm_pmic_update_reg(struct acpm_handle *handle,
++			 unsigned int acpm_chan_id, u8 type, u8 reg, u8 chan,
++			 u8 value, u8 mask);
++int acpm_pmic_read_reg_shutdown(struct acpm_handle *handle,
++				unsigned int acpm_chan_id, u8 type, u8 reg,
++				u8 chan, u8 *buf);
++int acpm_pmic_write_reg_shutdown(struct acpm_handle *handle,
++				 unsigned int acpm_chan_id, u8 type, u8 reg,
++				 u8 chan, u8 value);
++#endif /* __EXYNOS_ACPM_PMIC_H__ */
+diff --git a/drivers/firmware/samsung/exynos-acpm.c b/drivers/firmware/samsung/exynos-acpm.c
+new file mode 100644
+index 000000000..2483f782c
+--- /dev/null
++++ b/drivers/firmware/samsung/exynos-acpm.c
+@@ -0,0 +1,1014 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright 2020 Samsung Electronics Co., Ltd.
++ * Copyright 2020 Google LLC.
++ * Copyright 2024 Linaro Ltd.
++ *
++ * Boot-042 R2 Safety Hardening (y2s / SM-G985F):
++ *   - Issue A: Atomic-safe locking (spinlock_t + SYS_OFF_MODE_POWER_OFF_PREPARE
++ *     quiesce barrier) and atomic polling (readl_poll_timeout_atomic, udelay,
++ *     ktime_get_mono_fast_ns) so acpm_power_off_notify() never sleeps or
++ *     deadlocks after local_irq_disable() + smp_send_stop().
++ *   - Issue B: Explicit boot-time S2MPS19 RTC WTSR/SMPL verification and
++ *     re-arming in acpm_probe() preserving timer bits, with readback check.
++ */
++
++#include <linux/atomic.h>
++#include <linux/bitfield.h>
++#include <linux/bitmap.h>
++#include <linux/bitops.h>
++#include <linux/container_of.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/find.h>
++#include <linux/firmware/samsung/exynos-acpm-protocol.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/ktime.h>
++#include <linux/mailbox/exynos-message.h>
++#include <linux/mailbox_client.h>
++#include <linux/module.h>
++#include <linux/math.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/reboot.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++
++#include "exynos-acpm.h"
++#include "exynos-acpm-dvfs.h"
++#include "exynos-acpm-pmic.h"
++
++#define ACPM_PROTOCOL_SEQNUM		GENMASK(21, 16)
++
++#define ACPM_POLL_TIMEOUT_US		(100 * USEC_PER_MSEC)
++#define ACPM_TX_TIMEOUT_US		500000
++#define ACPM_SHUTDOWN_LOCK_TIMEOUT_US	(100 * USEC_PER_MSEC)
++
++/* AP2APM mailbox RX-direction (group 1) interrupt regs, mailbox-base relative. */
++#define ACPM_MBOX_INTCR1		0x20
++#define ACPM_MBOX_INTSR1		0x28
++
++#define ACPM_GS101_INITDATA_BASE	0xa000
++#define ACPM_EXYNOS990_INITDATA_BASE	0x7000
++
++struct acpm_shmem {
++	u32 reserved[2];
++	u32 chans;
++	u32 reserved1[3];
++	u32 num_chans;
++};
++
++struct acpm_chan_shmem {
++	u32 id;
++	u32 reserved[3];
++	u32 rx_rear;
++	u32 rx_front;
++	u32 rx_base;
++	u32 reserved1[3];
++	u32 tx_rear;
++	u32 tx_front;
++	u32 tx_base;
++	u32 qlen;
++	u32 mlen;
++	u32 reserved2[2];
++	u32 poll_completion;
++};
++
++struct acpm_queue {
++	void __iomem *rear;
++	void __iomem *front;
++	void __iomem *base;
++};
++
++struct acpm_rx_data {
++	u32 *cmd;
++	size_t cmdcnt;
++	size_t rxcnt;
++	bool completed;
++};
++
++#define ACPM_SEQNUM_MAX    64
++
++struct acpm_chan {
++	struct mbox_client cl;
++	struct mbox_chan *chan;
++	struct acpm_info *acpm;
++	struct acpm_queue tx;
++	struct acpm_queue rx;
++	spinlock_t tx_lock;
++	spinlock_t rx_lock;
++
++	unsigned int qlen;
++	unsigned int mlen;
++	u8 seqnum;
++	u8 id;
++	bool poll_completion;
++
++	DECLARE_BITMAP(bitmap_seqnum, ACPM_SEQNUM_MAX - 1);
++	struct acpm_rx_data rx_data[ACPM_SEQNUM_MAX];
++};
++
++struct acpm_info {
++	struct acpm_shmem __iomem *shmem;
++	void __iomem *sram_base;
++	void __iomem *mbox_intr;
++	struct acpm_chan *chans;
++	struct device *dev;
++	struct acpm_handle handle;
++	u32 num_chans;
++	atomic_t shutting_down;
++};
++
++struct acpm_match_data {
++	loff_t initdata_base;
++	const char *acpm_clk_dev_name;
++	bool manage_s2mps19_wtsr_smpl;
++};
++
++#define client_to_acpm_chan(c) container_of(c, struct acpm_chan, cl)
++#define handle_to_acpm_info(h) container_of(h, struct acpm_info, handle)
++
++static bool acpm_spin_lock_acquire(spinlock_t *lock, unsigned long *flags,
++				   bool shutdown_path)
++{
++	u64 deadline;
++
++	if (!shutdown_path) {
++		spin_lock_irqsave(lock, *flags);
++		return true;
++	}
++
++	/*
++	 * During SYS_OFF_MODE_POWER_OFF, acpm_power_off_prepare() has already
++	 * set shutting_down=1 and drained all channel locks before
++	 * smp_send_stop(). Use bounded trylock as defense-in-depth so an
++	 * abnormal direct machine_power_off() can never deadlock.
++	 */
++	deadline = ktime_get_mono_fast_ns() +
++		   (u64)ACPM_SHUTDOWN_LOCK_TIMEOUT_US * NSEC_PER_USEC;
++	do {
++		if (spin_trylock_irqsave(lock, *flags))
++			return true;
++		udelay(20);
++	} while (ktime_get_mono_fast_ns() < deadline);
++
++	return false;
++}
++
++static void acpm_get_saved_rx(struct acpm_chan *achan,
++			      const struct acpm_xfer *xfer, u32 tx_seqnum)
++{
++	const struct acpm_rx_data *rx_data = &achan->rx_data[tx_seqnum - 1];
++	u32 rx_seqnum;
++
++	if (!rx_data->rxcnt)
++		return;
++
++	rx_seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, rx_data->cmd[0]);
++
++	if (rx_seqnum == tx_seqnum)
++		memcpy(xfer->rxd, rx_data->cmd, xfer->rxcnt * sizeof(*xfer->rxd));
++}
++
++static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
++		       bool *native_match, bool shutdown_path)
++{
++	u32 rx_front, rx_seqnum, tx_seqnum, seqnum;
++	const void __iomem *base, *addr;
++	struct acpm_rx_data *rx_data;
++	unsigned long flags;
++	u32 i, val, mlen;
++	int ret = 0;
++
++	*native_match = false;
++
++	if (!acpm_spin_lock_acquire(&achan->rx_lock, &flags, shutdown_path))
++		return -EBUSY;
++
++	rx_front = readl(achan->rx.front);
++	i = readl(achan->rx.rear);
++
++	tx_seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->txd[0]);
++
++	if (i == rx_front)
++		goto out_unlock;
++
++	base = achan->rx.base;
++	mlen = achan->mlen;
++
++	/* Drain RX queue. */
++	do {
++		addr = base + mlen * i;
++		val = readl(addr);
++
++		rx_seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, val);
++		if (!rx_seqnum || rx_seqnum > ACPM_SEQNUM_MAX) {
++			ret = -EIO;
++			goto out_unlock;
++		}
++
++		seqnum = rx_seqnum - 1;
++		rx_data = &achan->rx_data[seqnum];
++
++		if (rx_data->rxcnt) {
++			if (rx_seqnum == tx_seqnum) {
++				__ioread32_copy(xfer->rxd, addr, xfer->rxcnt);
++				smp_store_release(&rx_data->completed, true);
++				*native_match = true;
++			} else {
++				__ioread32_copy(rx_data->cmd, addr,
++						rx_data->rxcnt);
++				smp_store_release(&rx_data->completed, true);
++			}
++		} else {
++			smp_store_release(&rx_data->completed, true);
++			if (rx_seqnum == tx_seqnum)
++				*native_match = true;
++		}
++
++		i = (i + 1) % achan->qlen;
++	} while (i != rx_front);
++
++	/* We saved all responses, mark RX empty. */
++	writel(rx_front, achan->rx.rear);
++
++out_unlock:
++	spin_unlock_irqrestore(&achan->rx_lock, flags);
++	return ret;
++}
++
++static int acpm_dequeue_by_polling(struct acpm_chan *achan,
++				   const struct acpm_xfer *xfer,
++				   bool shutdown_path)
++{
++	struct device *dev = achan->acpm->dev;
++	bool native_match;
++	u64 deadline;
++	u32 seqnum;
++	int ret;
++
++	seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->txd[0]);
++
++	deadline = ktime_get_mono_fast_ns() +
++		   (u64)ACPM_POLL_TIMEOUT_US * NSEC_PER_USEC;
++	do {
++		ret = acpm_get_rx(achan, xfer, &native_match, shutdown_path);
++		if (ret) {
++			clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
++			return ret;
++		}
++
++		if (smp_load_acquire(&achan->rx_data[seqnum - 1].completed)) {
++			if (!native_match)
++				acpm_get_saved_rx(achan, xfer, seqnum);
++
++			clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
++			return 0;
++		}
++
++		udelay(20);
++	} while (ktime_get_mono_fast_ns() < deadline);
++
++	clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
++	dev_err(dev, "Timeout! ch:%u s:%u bitmap:%lx.\n",
++		achan->id, seqnum, achan->bitmap_seqnum[0]);
++
++	return -ETIME;
++}
++
++static int acpm_wait_for_queue_slots(struct acpm_chan *achan, u32 next_tx_front)
++{
++	u32 val;
++	int ret;
++
++	/*
++	 * Use atomic polling so TX slot waits never sleep and remain safe
++	 * while holding tx_lock spinlock and during IRQ-disabled shutdown.
++	 */
++	ret = readl_poll_timeout_atomic(achan->rx.front, val,
++					next_tx_front != val, 10,
++					ACPM_TX_TIMEOUT_US);
++	if (ret) {
++		dev_err(achan->acpm->dev, "RX front can not keep up with TX front.\n");
++		return ret;
++	}
++
++	ret = readl_poll_timeout_atomic(achan->tx.rear, val,
++					next_tx_front != val, 10,
++					ACPM_TX_TIMEOUT_US);
++	if (ret)
++		dev_err(achan->acpm->dev, "TX queue is full.\n");
++
++	return ret;
++}
++
++static int acpm_prepare_xfer(struct acpm_chan *achan,
++			     const struct acpm_xfer *xfer)
++{
++	struct acpm_rx_data *rx_data;
++	u32 *txd = (u32 *)xfer->txd;
++	unsigned long size = ACPM_SEQNUM_MAX - 1;
++	unsigned long bit = achan->seqnum;
++
++	bit = find_next_zero_bit(achan->bitmap_seqnum, size, bit);
++	if (bit >= size) {
++		bit = find_first_zero_bit(achan->bitmap_seqnum, size);
++		if (bit >= size) {
++			dev_err_ratelimited(achan->acpm->dev,
++					    "ACPM sequence number pool exhausted\n");
++			return -EBUSY;
++		}
++	}
++
++	if (WARN_ON_ONCE(test_and_set_bit_lock(bit, achan->bitmap_seqnum)))
++		return -EIO;
++
++	/* Flag the index based on seqnum. (seqnum: 1~63, bitmap: 0~62) */
++	achan->seqnum = bit + 1;
++	txd[0] |= FIELD_PREP(ACPM_PROTOCOL_SEQNUM, achan->seqnum);
++
++	rx_data = &achan->rx_data[bit];
++	rx_data->completed = false;
++	memset(rx_data->cmd, 0, sizeof(*rx_data->cmd) * rx_data->cmdcnt);
++	rx_data->rxcnt = xfer->rxcnt;
++
++	return 0;
++}
++
++static int acpm_wait_for_message_response(struct acpm_chan *achan,
++					  const struct acpm_xfer *xfer,
++					  bool shutdown_path)
++{
++	return acpm_dequeue_by_polling(achan, xfer, shutdown_path);
++}
++
++static int acpm_wait_for_singleslot_response(struct acpm_chan *achan,
++					     const struct acpm_xfer *xfer)
++{
++	struct acpm_info *acpm = achan->acpm;
++	u32 seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->txd[0]);
++	u32 val;
++	int ret;
++
++	if (!acpm->mbox_intr) {
++		clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
++		return -ENODEV;
++	}
++
++	ret = readl_poll_timeout_atomic(acpm->mbox_intr + ACPM_MBOX_INTSR1, val,
++					val & (1u << achan->id), 20,
++					ACPM_POLL_TIMEOUT_US);
++	if (!ret && xfer->rxcnt && xfer->rxd)
++		memcpy_fromio(xfer->rxd, achan->rx.base,
++			      xfer->rxcnt * sizeof(*xfer->rxd));
++
++	writel(1u << achan->id, acpm->mbox_intr + ACPM_MBOX_INTCR1);
++	clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
++	return ret;
++}
++
++static int __acpm_do_xfer(struct acpm_handle *handle,
++			  const struct acpm_xfer *xfer, bool shutdown_path)
++{
++	struct acpm_info *acpm = handle_to_acpm_info(handle);
++	struct exynos_mbox_msg msg;
++	struct acpm_chan *achan;
++	unsigned long flags;
++	u32 idx, tx_front, seqnum;
++	int ret;
++
++	if (!shutdown_path && atomic_read(&acpm->shutting_down))
++		return -ESHUTDOWN;
++
++	if (xfer->acpm_chan_id >= acpm->num_chans)
++		return -EINVAL;
++
++	achan = &acpm->chans[xfer->acpm_chan_id];
++
++	if (!xfer->txd ||
++	    (xfer->txcnt * sizeof(*xfer->txd) > achan->mlen) ||
++	    (xfer->rxcnt * sizeof(*xfer->rxd) > achan->mlen))
++		return -EINVAL;
++
++	if (!achan->poll_completion)
++		dev_dbg(achan->acpm->dev,
++			"polling interrupt-mode ACPM channel %u\n",
++			xfer->acpm_chan_id);
++
++	msg.chan_id = xfer->acpm_chan_id;
++	msg.chan_type = EXYNOS_MBOX_CHAN_TYPE_DOORBELL;
++
++	if (!acpm_spin_lock_acquire(&achan->tx_lock, &flags, shutdown_path))
++		return -EBUSY;
++
++	if (!shutdown_path && atomic_read(&acpm->shutting_down)) {
++		spin_unlock_irqrestore(&achan->tx_lock, flags);
++		return -ESHUTDOWN;
++	}
++
++	tx_front = readl(achan->tx.front);
++	idx = (tx_front + 1) % achan->qlen;
++
++	if (achan->qlen > 1) {
++		ret = acpm_wait_for_queue_slots(achan, idx);
++		if (ret) {
++			spin_unlock_irqrestore(&achan->tx_lock, flags);
++			return ret;
++		}
++	}
++
++	ret = acpm_prepare_xfer(achan, xfer);
++	if (ret) {
++		spin_unlock_irqrestore(&achan->tx_lock, flags);
++		return ret;
++	}
++	seqnum = achan->seqnum;
++
++	__iowrite32_copy(achan->tx.base + achan->mlen * tx_front,
++			 xfer->txd, xfer->txcnt);
++	writel(idx, achan->tx.front);
++
++	ret = mbox_send_message(achan->chan, (void *)&msg);
++	if (ret < 0) {
++		clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
++		spin_unlock_irqrestore(&achan->tx_lock, flags);
++		return ret;
++	}
++
++	mbox_client_txdone(achan->chan, 0);
++	spin_unlock_irqrestore(&achan->tx_lock, flags);
++
++	if (achan->qlen == 1)
++		return acpm_wait_for_singleslot_response(achan, xfer);
++
++	return acpm_wait_for_message_response(achan, xfer, shutdown_path);
++}
++
++int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
++{
++	return __acpm_do_xfer(handle, xfer, false);
++}
++
++int acpm_do_xfer_shutdown(struct acpm_handle *handle,
++			  const struct acpm_xfer *xfer)
++{
++	return __acpm_do_xfer(handle, xfer, true);
++}
++
++void acpm_set_xfer(struct acpm_xfer *xfer, u32 *cmd, size_t cmdcnt,
++		   unsigned int acpm_chan_id, bool response)
++{
++	xfer->acpm_chan_id = acpm_chan_id;
++	xfer->txcnt = cmdcnt;
++	xfer->txd = cmd;
++
++	if (response) {
++		xfer->rxcnt = cmdcnt;
++		xfer->rxd = cmd;
++	} else {
++		xfer->rxcnt = 0;
++		xfer->rxd = NULL;
++	}
++}
++
++static void acpm_chan_shmem_get_params(struct acpm_chan *achan,
++				struct acpm_chan_shmem __iomem *chan_shmem)
++{
++	void __iomem *base = achan->acpm->sram_base;
++	struct acpm_queue *rx = &achan->rx;
++	struct acpm_queue *tx = &achan->tx;
++
++	achan->mlen = readl(&chan_shmem->mlen);
++	achan->poll_completion = readl(&chan_shmem->poll_completion);
++	achan->id = readl(&chan_shmem->id);
++	achan->qlen = readl(&chan_shmem->qlen);
++
++	tx->base = base + readl(&chan_shmem->rx_base);
++	tx->rear = base + readl(&chan_shmem->rx_rear);
++	tx->front = base + readl(&chan_shmem->rx_front);
++
++	rx->base = base + readl(&chan_shmem->tx_base);
++	rx->rear = base + readl(&chan_shmem->tx_rear);
++	rx->front = base + readl(&chan_shmem->tx_front);
++
++	dev_info(achan->acpm->dev,
++		 "acpm chan idx=%d id=%d poll=%d mlen=%d qlen=%d\n",
++		 (int)(achan - achan->acpm->chans), achan->id,
++		 achan->poll_completion, achan->mlen, achan->qlen);
++}
++
++static int acpm_achan_alloc_cmds(struct acpm_chan *achan)
++{
++	struct device *dev = achan->acpm->dev;
++	struct acpm_rx_data *rx_data;
++	size_t cmd_size, cmdcnt;
++	int i;
++
++	if (achan->mlen == 0)
++		return 0;
++
++	cmd_size = sizeof(*(achan->rx_data[0].cmd));
++	cmdcnt = DIV_ROUND_UP_ULL(achan->mlen, cmd_size);
++
++	for (i = 0; i < ACPM_SEQNUM_MAX; i++) {
++		rx_data = &achan->rx_data[i];
++		rx_data->cmdcnt = cmdcnt;
++		rx_data->cmd = devm_kcalloc(dev, cmdcnt, cmd_size, GFP_KERNEL);
++		if (!rx_data->cmd)
++			return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static void acpm_free_mbox_chans(void *data)
++{
++	struct acpm_info *acpm = data;
++	int i;
++
++	for (i = 0; i < acpm->num_chans; i++)
++		if (!IS_ERR_OR_NULL(acpm->chans[i].chan))
++			mbox_free_channel(acpm->chans[i].chan);
++}
++
++static int acpm_channels_init(struct acpm_info *acpm)
++{
++	struct acpm_shmem __iomem *shmem = acpm->shmem;
++	struct acpm_chan_shmem __iomem *chans_shmem;
++	struct device *dev = acpm->dev;
++	int i, ret;
++
++	acpm->num_chans = readl(&shmem->num_chans);
++	acpm->chans = devm_kcalloc(dev, acpm->num_chans, sizeof(*acpm->chans),
++				   GFP_KERNEL);
++	if (!acpm->chans)
++		return -ENOMEM;
++
++	ret = devm_add_action_or_reset(dev, acpm_free_mbox_chans, acpm);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to add mbox free action.\n");
++
++	chans_shmem = acpm->sram_base + readl(&shmem->chans);
++
++	for (i = 0; i < acpm->num_chans; i++) {
++		struct acpm_chan_shmem __iomem *chan_shmem = &chans_shmem[i];
++		struct acpm_chan *achan = &acpm->chans[i];
++		struct mbox_client *cl = &achan->cl;
++
++		achan->acpm = acpm;
++
++		acpm_chan_shmem_get_params(achan, chan_shmem);
++
++		ret = acpm_achan_alloc_cmds(achan);
++		if (ret)
++			return ret;
++
++		spin_lock_init(&achan->rx_lock);
++		spin_lock_init(&achan->tx_lock);
++
++		cl->dev = dev;
++
++		achan->chan = mbox_request_channel(cl, 0);
++		if (IS_ERR(achan->chan))
++			return PTR_ERR(achan->chan);
++	}
++
++	return 0;
++}
++
++static void acpm_clk_pdev_unregister(void *data)
++{
++	platform_device_unregister(data);
++}
++
++static const struct acpm_ops exynos_acpm_driver_ops = {
++	.dvfs = {
++		.set_rate = acpm_dvfs_set_rate,
++		.get_rate = acpm_dvfs_get_rate,
++	},
++
++	.pmic = {
++		.read_reg = acpm_pmic_read_reg,
++		.bulk_read = acpm_pmic_bulk_read,
++		.write_reg = acpm_pmic_write_reg,
++		.bulk_write = acpm_pmic_bulk_write,
++		.update_reg = acpm_pmic_update_reg,
++	},
++};
++
++/*
++ * Exynos990 / SM-G985F (y2s) S2MPS19 RTC WTSR/SMPL management:
++ * Verified against y2s-original.dts (s2mps19mfd@00):
++ *   acpm-ipc-channel = <2>, acpm-speedy-channel = <0>,
++ *   wtsr_en = "enabled", smpl_en = "enabled",
++ *   wtsr_timer_val = <0x03>, smpl_timer_val = <0x02>.
++ *
++ * RTC reg 0x01 bit layout (include/linux/mfd/samsung/rtc.h):
++ *   bit 7: SMPL_EN, bit 6: WTSR_EN, bits [5:3]: SMPL_TIMER, bits [2:0]: WTSR_TIMER.
++ * Default fallback timer bits (0x23 -> 0xe3 with EN bits set) used ONLY if
++ * reg 0x01 was completely zeroed by total battery POR; otherwise existing
++ * S-Boot timer bits [5:0] are strictly preserved.
++ */
++#define S2MPS19_ACPM_CHAN		2	/* acpm-ipc-channel (firmware id 2) */
++#define S2MPS19_SPEEDY_CHAN		0	/* main PMIC speedy channel */
++#define S2MPS19_TYPE_RTC		0x02	/* S2MPS19 RTC sub-block address */
++#define S2MP_RTC_REG_WTSR_SMPL		0x01	/* WTSR_EN=bit6 SMPL_EN=bit7 */
++#define S2MP_RTC_WTSR_EN		BIT(6)
++#define S2MP_RTC_SMPL_EN		BIT(7)
++#define S2MP_RTC_WTSR_SMPL_EN		(S2MP_RTC_WTSR_EN | S2MP_RTC_SMPL_EN)
++#define S2MP_RTC_WTSR_SMPL_TIMER_MASK	GENMASK(5, 0)
++#define S2MP_RTC_WTSR_SMPL_DEFAULT_TMR	0x23	/* 0x23 | 0xc0 = 0xe3 */
++
++static void s2mps19_enable_wtsr_smpl(struct acpm_info *acpm)
++{
++	u8 val = 0, target, after = 0;
++	int ret;
++
++	ret = acpm_pmic_read_reg(&acpm->handle, S2MPS19_ACPM_CHAN,
++				 S2MPS19_TYPE_RTC, S2MP_RTC_REG_WTSR_SMPL,
++				 S2MPS19_SPEEDY_CHAN, &val);
++	if (ret) {
++		dev_warn(acpm->dev, "ACPM: boot WTSR_SMPL read failed (%d)\n", ret);
++		return;
++	}
++
++	dev_info(acpm->dev,
++		 "ACPM: boot RTC WTSR_SMPL=0x%02x (WTSR_EN=%u SMPL_EN=%u timers=0x%02x)\n",
++		 val, !!(val & S2MP_RTC_WTSR_EN), !!(val & S2MP_RTC_SMPL_EN),
++		 (unsigned int)(val & S2MP_RTC_WTSR_SMPL_TIMER_MASK));
++
++	if ((val & S2MP_RTC_WTSR_SMPL_EN) == S2MP_RTC_WTSR_SMPL_EN &&
++	    (val & S2MP_RTC_WTSR_SMPL_TIMER_MASK) != 0) {
++		dev_info(acpm->dev, "ACPM: WTSR/SMPL already armed at boot\n");
++		return;
++	}
++
++	if (val & S2MP_RTC_WTSR_SMPL_TIMER_MASK)
++		target = val | S2MP_RTC_WTSR_SMPL_EN;
++	else
++		target = S2MP_RTC_WTSR_SMPL_DEFAULT_TMR | S2MP_RTC_WTSR_SMPL_EN;
++
++	ret = acpm_pmic_write_reg(&acpm->handle, S2MPS19_ACPM_CHAN,
++				  S2MPS19_TYPE_RTC, S2MP_RTC_REG_WTSR_SMPL,
++				  S2MPS19_SPEEDY_CHAN, target);
++	if (ret) {
++		dev_err(acpm->dev, "ACPM: boot WTSR_SMPL re-arm write 0x%02x failed (%d)\n",
++			target, ret);
++		return;
++	}
++
++	ret = acpm_pmic_read_reg(&acpm->handle, S2MPS19_ACPM_CHAN,
++				 S2MPS19_TYPE_RTC, S2MP_RTC_REG_WTSR_SMPL,
++				 S2MPS19_SPEEDY_CHAN, &after);
++	if (ret || (after & S2MP_RTC_WTSR_SMPL_EN) != S2MP_RTC_WTSR_SMPL_EN) {
++		dev_err(acpm->dev,
++			"ACPM: boot WTSR_SMPL verify mismatch (wrote=0x%02x read=0x%02x ret=%d)\n",
++			target, after, ret);
++		return;
++	}
++
++	dev_info(acpm->dev, "ACPM: WTSR/SMPL re-armed at boot (0x%02x -> 0x%02x)\n",
++		 val, after);
++}
++
++static void s2mps19_disable_wtsr_smpl(struct acpm_info *acpm)
++{
++	u8 val = 0, target, after = 0;
++	int ret;
++
++	ret = acpm_pmic_read_reg_shutdown(&acpm->handle, S2MPS19_ACPM_CHAN,
++					  S2MPS19_TYPE_RTC, S2MP_RTC_REG_WTSR_SMPL,
++					  S2MPS19_SPEEDY_CHAN, &val);
++	if (ret) {
++		dev_emerg(acpm->dev, "ACPM: WTSR_SMPL read failed (%d)\n", ret);
++		return;
++	}
++
++	dev_emerg(acpm->dev, "ACPM: RTC WTSR_SMPL=0x%02x before power off\n", val);
++
++	if (!(val & S2MP_RTC_WTSR_SMPL_EN))
++		return;	/* already disarmed */
++
++	target = val & ~S2MP_RTC_WTSR_SMPL_EN;
++	ret = acpm_pmic_write_reg_shutdown(&acpm->handle, S2MPS19_ACPM_CHAN,
++					   S2MPS19_TYPE_RTC, S2MP_RTC_REG_WTSR_SMPL,
++					   S2MPS19_SPEEDY_CHAN, target);
++	if (ret) {
++		dev_emerg(acpm->dev, "ACPM: WTSR_SMPL clear failed (%d)\n", ret);
++		return;
++	}
++
++	ret = acpm_pmic_read_reg_shutdown(&acpm->handle, S2MPS19_ACPM_CHAN,
++					  S2MPS19_TYPE_RTC, S2MP_RTC_REG_WTSR_SMPL,
++					  S2MPS19_SPEEDY_CHAN, &after);
++	dev_emerg(acpm->dev, "ACPM: WTSR_SMPL cleared, readback=0x%02x (ret=%d)\n",
++		  after, ret);
++}
++
++#define ACPM_IPC_PROTOCOL_STOP		22
++#define ACPM_POWEROFF_CHAN_ID		4	/* samsung,exynos-acpm framework channel id */
++
++static int acpm_enter_wfi(struct acpm_info *acpm)
++{
++	u32 cmd[4] = { BIT(ACPM_IPC_PROTOCOL_STOP) };
++	struct acpm_xfer xfer;
++	unsigned int i, cnt;
++	int idx = -1;
++
++	/* Select the framework channel by firmware id, not array index. */
++	for (i = 0; i < acpm->num_chans; i++) {
++		if (acpm->chans[i].id == ACPM_POWEROFF_CHAN_ID) {
++			idx = i;
++			break;
++		}
++	}
++	if (idx < 0)
++		return -ENODEV;
++
++	cnt = ARRAY_SIZE(cmd);
++	if (cnt > acpm->chans[idx].mlen / sizeof(u32))
++		cnt = acpm->chans[idx].mlen / sizeof(u32);
++	if (!cnt)
++		return -EINVAL;
++
++	dev_emerg(acpm->dev, "ACPM: STOP on chan idx=%d id=%d cnt=%u\n",
++		  idx, ACPM_POWEROFF_CHAN_ID, cnt);
++	acpm_set_xfer(&xfer, cmd, cnt, idx, true);
++	return acpm_do_xfer_shutdown(&acpm->handle, &xfer);
++}
++
++/*
++ * Runs in process context with IRQs enabled BEFORE migrate_to_reboot_cpu()
++ * and smp_send_stop(). Quiesces all non-shutdown ACPM callers and drains
++ * every channel's tx_lock and rx_lock so no stopped CPU can hold a lock
++ * when acpm_power_off_notify() runs in IRQ-disabled atomic context.
++ */
++static int acpm_power_off_prepare(struct sys_off_data *data)
++{
++	struct acpm_info *acpm = data->cb_data;
++	unsigned long flags;
++	unsigned int i;
++
++	atomic_set(&acpm->shutting_down, 1);
++	smp_mb();
++
++	for (i = 0; i < acpm->num_chans; i++) {
++		spin_lock_irqsave(&acpm->chans[i].tx_lock, flags);
++		spin_unlock_irqrestore(&acpm->chans[i].tx_lock, flags);
++
++		spin_lock_irqsave(&acpm->chans[i].rx_lock, flags);
++		spin_unlock_irqrestore(&acpm->chans[i].rx_lock, flags);
++	}
++
++	dev_info(acpm->dev, "ACPM: power-off prepare quiesced %u channels\n",
++		 acpm->num_chans);
++	return NOTIFY_DONE;
++}
++
++static int acpm_power_off_notify(struct sys_off_data *data)
++{
++	struct acpm_info *acpm = data->cb_data;
++	int ret;
++
++	/* Ensure normal callers are blocked even if prepare was bypassed. */
++	atomic_set(&acpm->shutting_down, 1);
++
++	/*
++	 * Disarm the PMIC WTSR/SMPL watchdog first, while the APM is still
++	 * alive to service the PMIC channel.
++	 */
++	s2mps19_disable_wtsr_smpl(acpm);
++
++	dev_emerg(acpm->dev, "ACPM: halting APM before power off\n");
++	ret = acpm_enter_wfi(acpm);
++	if (ret)
++		dev_emerg(acpm->dev, "ACPM: enter WFI failed (%d)\n", ret);
++
++	/* DONE so syscon-poweroff runs next (prio 192 < 224) and drops PS_HOLD. */
++	return NOTIFY_DONE;
++}
++
++static int acpm_probe(struct platform_device *pdev)
++{
++	const struct acpm_match_data *match_data;
++	struct platform_device *acpm_clk_pdev;
++	struct device *dev = &pdev->dev;
++	struct device_node *shmem;
++	struct acpm_info *acpm;
++	resource_size_t size;
++	struct resource res;
++	int ret;
++
++	acpm = devm_kzalloc(dev, sizeof(*acpm), GFP_KERNEL);
++	if (!acpm)
++		return -ENOMEM;
++
++	atomic_set(&acpm->shutting_down, 0);
++
++	shmem = of_parse_phandle(dev->of_node, "shmem", 0);
++	ret = of_address_to_resource(shmem, 0, &res);
++	of_node_put(shmem);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "Failed to get shared memory.\n");
++
++	size = resource_size(&res);
++	acpm->sram_base = devm_ioremap(dev, res.start, size);
++	if (!acpm->sram_base)
++		return dev_err_probe(dev, -ENOMEM,
++				     "Failed to ioremap shared memory.\n");
++
++	match_data = of_device_get_match_data(dev);
++	if (!match_data)
++		return dev_err_probe(dev, -EINVAL,
++				     "Failed to get match data.\n");
++
++	acpm->shmem = acpm->sram_base + match_data->initdata_base;
++	acpm->dev = dev;
++
++	{
++		struct device_node *mbox_np =
++			of_parse_phandle(dev->of_node, "mboxes", 0);
++
++		if (mbox_np) {
++			acpm->mbox_intr = of_iomap(mbox_np, 0);
++			of_node_put(mbox_np);
++		}
++	}
++
++	ret = acpm_channels_init(acpm);
++	if (ret)
++		return ret;
++
++	acpm->handle.ops = &exynos_acpm_driver_ops;
++
++	platform_set_drvdata(pdev, acpm);
++
++	if (match_data->manage_s2mps19_wtsr_smpl)
++		s2mps19_enable_wtsr_smpl(acpm);
++
++	if (match_data->acpm_clk_dev_name) {
++		acpm_clk_pdev = platform_device_register_data(dev,
++						match_data->acpm_clk_dev_name,
++						PLATFORM_DEVID_NONE, NULL, 0);
++		if (IS_ERR(acpm_clk_pdev))
++			return dev_err_probe(dev, PTR_ERR(acpm_clk_pdev),
++				     "Failed to register ACPM clocks device.\n");
++
++		ret = devm_add_action_or_reset(dev, acpm_clk_pdev_unregister,
++				       acpm_clk_pdev);
++		if (ret)
++			return dev_err_probe(dev, ret, "Failed to add devm action.\n");
++	}
++
++	if (match_data->manage_s2mps19_wtsr_smpl) {
++		ret = devm_register_sys_off_handler(dev,
++						    SYS_OFF_MODE_POWER_OFF_PREPARE,
++						    SYS_OFF_PRIO_FIRMWARE,
++						    acpm_power_off_prepare,
++						    acpm);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "Failed to register power-off prepare handler.\n");
++
++		ret = devm_register_sys_off_handler(dev,
++						    SYS_OFF_MODE_POWER_OFF,
++						    SYS_OFF_PRIO_FIRMWARE,
++						    acpm_power_off_notify,
++						    acpm);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "Failed to register power-off handler.\n");
++	}
++
++	return devm_of_platform_populate(dev);
++}
++
++static void acpm_handle_put(struct acpm_handle *handle)
++{
++	struct acpm_info *acpm = handle_to_acpm_info(handle);
++	struct device *dev = acpm->dev;
++
++	module_put(dev->driver->owner);
++	put_device(dev);
++}
++
++static void devm_acpm_release(struct device *dev, void *res)
++{
++	acpm_handle_put(*(struct acpm_handle **)res);
++}
++
++static struct acpm_handle *acpm_get_by_node(struct device *dev,
++					    struct device_node *np)
++{
++	struct platform_device *pdev;
++	struct device_link *link;
++	struct acpm_info *acpm;
++
++	pdev = of_find_device_by_node(np);
++	if (!pdev)
++		return ERR_PTR(-EPROBE_DEFER);
++
++	acpm = platform_get_drvdata(pdev);
++	if (!acpm) {
++		platform_device_put(pdev);
++		return ERR_PTR(-EPROBE_DEFER);
++	}
++
++	if (!try_module_get(pdev->dev.driver->owner)) {
++		platform_device_put(pdev);
++		return ERR_PTR(-EPROBE_DEFER);
++	}
++
++	link = device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_SUPPLIER);
++	if (!link) {
++		dev_err(&pdev->dev,
++			"Failed to create device link to consumer %s.\n",
++			dev_name(dev));
++		platform_device_put(pdev);
++		module_put(pdev->dev.driver->owner);
++		return ERR_PTR(-EINVAL);
++	}
++
++	return &acpm->handle;
++}
++
++struct acpm_handle *devm_acpm_get_by_node(struct device *dev,
++					  struct device_node *np)
++{
++	struct acpm_handle **ptr, *handle;
++
++	ptr = devres_alloc(devm_acpm_release, sizeof(*ptr), GFP_KERNEL);
++	if (!ptr)
++		return ERR_PTR(-ENOMEM);
++
++	handle = acpm_get_by_node(dev, np);
++	if (!IS_ERR(handle)) {
++		*ptr = handle;
++		devres_add(dev, ptr);
++	} else {
++		devres_free(ptr);
++	}
++
++	return handle;
++}
++EXPORT_SYMBOL_GPL(devm_acpm_get_by_node);
++
++struct acpm_handle *devm_acpm_get_by_phandle(struct device *dev)
++{
++	struct acpm_handle *handle;
++	struct device_node *np;
++
++	np = of_parse_phandle(dev->of_node, "samsung,acpm-ipc", 0);
++	if (!np)
++		return ERR_PTR(-ENODEV);
++
++	handle = devm_acpm_get_by_node(dev, np);
++	of_node_put(np);
++
++	return handle;
++}
++EXPORT_SYMBOL_GPL(devm_acpm_get_by_phandle);
++
++static const struct acpm_match_data acpm_gs101 = {
++	.initdata_base = ACPM_GS101_INITDATA_BASE,
++	.acpm_clk_dev_name = "gs101-acpm-clk",
++	.manage_s2mps19_wtsr_smpl = false,
++};
++
++/* exynos990 has no in-kernel ACPM clock provider yet. */
++static const struct acpm_match_data acpm_exynos990 = {
++	.initdata_base = ACPM_EXYNOS990_INITDATA_BASE,
++	.acpm_clk_dev_name = NULL,
++	.manage_s2mps19_wtsr_smpl = true,
++};
++
++static const struct of_device_id acpm_match[] = {
++	{
++		.compatible = "google,gs101-acpm-ipc",
++		.data = &acpm_gs101,
++	},
++	{
++		.compatible = "samsung,exynos990-acpm-ipc",
++		.data = &acpm_exynos990,
++	},
++	{},
++};
++MODULE_DEVICE_TABLE(of, acpm_match);
++
++static struct platform_driver acpm_driver = {
++	.probe	= acpm_probe,
++	.driver	= {
++		.name = "exynos-acpm-protocol",
++		.of_match_table	= acpm_match,
++	},
++};
++module_platform_driver(acpm_driver);
++
++MODULE_AUTHOR("Tudor Ambarus <tudor.ambarus@linaro.org>");
++MODULE_DESCRIPTION("Samsung Exynos ACPM mailbox protocol driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/firmware/samsung/exynos-acpm.h b/drivers/firmware/samsung/exynos-acpm.h
+new file mode 100644
+index 000000000..beb72321c
+--- /dev/null
++++ b/drivers/firmware/samsung/exynos-acpm.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __EXYNOS_ACPM_H__
++#define __EXYNOS_ACPM_H__
++
++#include <linux/types.h>
++
++struct acpm_xfer {
++	const u32 *txd;
++	u32 *rxd;
++	size_t txcnt;
++	size_t rxcnt;
++	unsigned int acpm_chan_id;
++};
++
++struct acpm_handle;
++
++void acpm_set_xfer(struct acpm_xfer *xfer, u32 *cmd, size_t cmdcnt,
++		   unsigned int acpm_chan_id, bool response);
++int acpm_do_xfer(struct acpm_handle *handle,
++		 const struct acpm_xfer *xfer);
++int acpm_do_xfer_shutdown(struct acpm_handle *handle,
++			  const struct acpm_xfer *xfer);
++
++#endif /* __EXYNOS_ACPM_H__ */
+diff --git a/drivers/mailbox/Kconfig b/drivers/mailbox/Kconfig
+index 6fb995778..831751e0e 100644
+--- a/drivers/mailbox/Kconfig
++++ b/drivers/mailbox/Kconfig
+@@ -36,6 +36,12 @@ config ARM_MHU_V3
+ 	  that provides different means of transports: supported extensions
+ 	  will be discovered and possibly managed at probe-time.
+ 
++config EXYNOS_MBOX
++	tristate "Exynos Mailbox"
++	depends on ARCH_EXYNOS || COMPILE_TEST
++	help
++	  Samsung Exynos Mailbox controller driver (ACPM doorbell).
++
+ config IMX_MBOX
+ 	tristate "i.MX Mailbox"
+ 	depends on ARCH_MXC || COMPILE_TEST
+diff --git a/drivers/mailbox/Makefile b/drivers/mailbox/Makefile
+index 3c3c27d54..f42229191 100644
+--- a/drivers/mailbox/Makefile
++++ b/drivers/mailbox/Makefile
+@@ -64,3 +64,4 @@ obj-$(CONFIG_SPRD_MBOX)		+= sprd-mailbox.o
+ obj-$(CONFIG_QCOM_CPUCP_MBOX)	+= qcom-cpucp-mbox.o
+ 
+ obj-$(CONFIG_QCOM_IPCC)		+= qcom-ipcc.o
++obj-$(CONFIG_EXYNOS_MBOX)	+= exynos-mailbox.o
+diff --git a/drivers/mailbox/exynos-mailbox.c b/drivers/mailbox/exynos-mailbox.c
+new file mode 100644
+index 000000000..f9f8c4bb5
+--- /dev/null
++++ b/drivers/mailbox/exynos-mailbox.c
+@@ -0,0 +1,186 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright 2020 Samsung Electronics Co., Ltd.
++ * Copyright 2020 Google LLC.
++ * Copyright 2024 Linaro Ltd.
++ */
++
++#include <linux/bitops.h>
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/io.h>
++#include <linux/mailbox_controller.h>
++#include <linux/mailbox/exynos-message.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++
++#define EXYNOS_MBOX_INTMR0		0x28	/* Interrupt Mask Register 0 */
++#define EXYNOS_MBOX_INTGR1		0x40	/* Interrupt Generation Register 1 */
++
++#define EXYNOS_MBOX_INTMR0_MASK		GENMASK(15, 0)
++#define EXYNOS_MBOX_INTGR1_MASK		GENMASK(15, 0)
++
++#define EXYNOS_MBOX_CHAN_COUNT		HWEIGHT32(EXYNOS_MBOX_INTGR1_MASK)
++
++/*
++ * The AP->APM doorbell register and its encoding differ per SoC.
++ * gs101:     write BIT(chan_id)       to INTGR1 (0x40); mask INTMR0 at 0x28.
++ * exynos990: write BIT(chan_id) << 16 to INTGR0 (0x08); mask INTMR0 at 0x10.
++ */
++struct exynos_mbox_data {
++	u32 intmr0;
++	u32 intmr1;
++	u32 doorbell_reg;
++	u32 doorbell_shift;
++};
++
++static const struct exynos_mbox_data gs101_mbox_data = {
++	.intmr0		= 0x28,
++	.doorbell_reg	= 0x40,
++	.doorbell_shift	= 0,
++};
++
++static const struct exynos_mbox_data exynos990_mbox_data = {
++	.intmr0		= 0x10,
++	.intmr1		= 0x24,
++	.doorbell_reg	= 0x08,
++	.doorbell_shift	= 16,
++};
++
++/**
++ * struct exynos_mbox - driver's private data.
++ * @regs:	mailbox registers base address.
++ * @mbox:	pointer to the mailbox controller.
++ */
++struct exynos_mbox {
++	void __iomem *regs;
++	struct mbox_controller *mbox;
++	const struct exynos_mbox_data *data;
++};
++
++static int exynos_mbox_send_data(struct mbox_chan *chan, void *data)
++{
++	struct device *dev = chan->mbox->dev;
++	struct exynos_mbox *exynos_mbox = dev_get_drvdata(dev);
++	struct exynos_mbox_msg *msg = data;
++
++	if (msg->chan_id >= exynos_mbox->mbox->num_chans) {
++		dev_err(dev, "Invalid channel ID %d\n", msg->chan_id);
++		return -EINVAL;
++	}
++
++	if (msg->chan_type != EXYNOS_MBOX_CHAN_TYPE_DOORBELL) {
++		dev_err(dev, "Unsupported channel type [%d]\n", msg->chan_type);
++		return -EINVAL;
++	}
++
++	writel(BIT(msg->chan_id) << exynos_mbox->data->doorbell_shift,
++	       exynos_mbox->regs + exynos_mbox->data->doorbell_reg);
++
++	return 0;
++}
++
++static const struct mbox_chan_ops exynos_mbox_chan_ops = {
++	.send_data = exynos_mbox_send_data,
++};
++
++static struct mbox_chan *exynos_mbox_of_xlate(struct mbox_controller *mbox,
++					      const struct of_phandle_args *sp)
++{
++	int i;
++
++	if (sp->args_count != 0)
++		return ERR_PTR(-EINVAL);
++
++	/*
++	 * Return the first available channel. When we don't pass the
++	 * channel ID from device tree, each channel populated by the driver is
++	 * just a software construct or a virtual channel. We use 'void *data'
++	 * in send_data() to pass the channel identifiers.
++	 */
++	for (i = 0; i < mbox->num_chans; i++)
++		if (mbox->chans[i].cl == NULL)
++			return &mbox->chans[i];
++	return ERR_PTR(-EINVAL);
++}
++
++static const struct of_device_id exynos_mbox_match[] = {
++	{ .compatible = "google,gs101-mbox", .data = &gs101_mbox_data },
++	{ .compatible = "samsung,exynos990-mbox", .data = &exynos990_mbox_data },
++	{},
++};
++MODULE_DEVICE_TABLE(of, exynos_mbox_match);
++
++static int exynos_mbox_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct exynos_mbox *exynos_mbox;
++	struct mbox_controller *mbox;
++	struct mbox_chan *chans;
++	struct clk *pclk;
++
++	exynos_mbox = devm_kzalloc(dev, sizeof(*exynos_mbox), GFP_KERNEL);
++	if (!exynos_mbox)
++		return -ENOMEM;
++
++	mbox = devm_kzalloc(dev, sizeof(*mbox), GFP_KERNEL);
++	if (!mbox)
++		return -ENOMEM;
++
++	chans = devm_kcalloc(dev, EXYNOS_MBOX_CHAN_COUNT, sizeof(*chans),
++			     GFP_KERNEL);
++	if (!chans)
++		return -ENOMEM;
++
++	exynos_mbox->data = of_device_get_match_data(dev);
++	if (!exynos_mbox->data)
++		return dev_err_probe(dev, -EINVAL, "No match data.\n");
++
++	exynos_mbox->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(exynos_mbox->regs))
++		return PTR_ERR(exynos_mbox->regs);
++
++	pclk = devm_clk_get_enabled(dev, "pclk");
++	if (IS_ERR(pclk))
++		return dev_err_probe(dev, PTR_ERR(pclk),
++				     "Failed to enable clock.\n");
++
++	mbox->num_chans = EXYNOS_MBOX_CHAN_COUNT;
++	mbox->chans = chans;
++	mbox->dev = dev;
++	mbox->ops = &exynos_mbox_chan_ops;
++	mbox->of_xlate = exynos_mbox_of_xlate;
++
++	exynos_mbox->mbox = mbox;
++
++	platform_set_drvdata(pdev, exynos_mbox);
++
++	/* Mask out all interrupts. We support just polling channels for now. */
++	writel(EXYNOS_MBOX_INTMR0_MASK,
++	       exynos_mbox->regs + exynos_mbox->data->intmr0);
++	/*
++	 * z3s: also mask the RX-direction (group 1) interrupts so that
++	 * interrupt-mode ACPM channels (e.g. CPU DVFS on channel 5) are
++	 * delivered in poll mode and serviced by the existing poll path.
++	 */
++	if (exynos_mbox->data->intmr1)
++		writel(EXYNOS_MBOX_INTMR0_MASK,
++		       exynos_mbox->regs + exynos_mbox->data->intmr1);
++
++	return devm_mbox_controller_register(dev, mbox);
++}
++
++static struct platform_driver exynos_mbox_driver = {
++	.probe	= exynos_mbox_probe,
++	.driver	= {
++		.name = "exynos-acpm-mbox",
++		.of_match_table	= exynos_mbox_match,
++	},
++};
++module_platform_driver(exynos_mbox_driver);
++
++MODULE_AUTHOR("Tudor Ambarus <tudor.ambarus@linaro.org>");
++MODULE_DESCRIPTION("Samsung Exynos mailbox driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/power/reset/syscon-poweroff.c b/drivers/power/reset/syscon-poweroff.c
+index 203936f4c..2407f3bbb 100644
+--- a/drivers/power/reset/syscon-poweroff.c
++++ b/drivers/power/reset/syscon-poweroff.c
+@@ -79,7 +79,7 @@ static int syscon_poweroff_probe(struct platform_device *pdev)
+ 
+ 	return devm_register_sys_off_handler(&pdev->dev,
+ 					     SYS_OFF_MODE_POWER_OFF,
+-					     SYS_OFF_PRIO_DEFAULT,
++					     SYS_OFF_PRIO_HIGH,
+ 					     syscon_poweroff, data);
+ }
+ 
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index bcfa63fb9..36585e6a4 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -396,6 +396,13 @@ config BATTERY_MAX17040
+ 
+ 	  Driver can be build as a module (max17040_battery).
+ 
++config CHARGER_MAX77705
++	tristate "Maxim MAX77705 battery charger driver"
++	depends on I2C
++	select REGMAP_I2C
++	help
++	  Say Y to enable support for the Maxim MAX77705 battery charger.
++
+ config BATTERY_MAX17042
+ 	tristate "Maxim MAX17042/17047/17050/8997/8966 family Fuel Gauge"
+ 	depends on I2C
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index 6673860ff..53b6608ff 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -117,3 +117,4 @@ obj-$(CONFIG_CHARGER_SURFACE)	+= surface_charger.o
+ obj-$(CONFIG_BATTERY_UG3105)	+= ug3105_battery.o
+ obj-$(CONFIG_CHARGER_QCOM_SMB2)	+= qcom_smbx.o
+ obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
++obj-$(CONFIG_CHARGER_MAX77705)	+= max77705_charger.o
+diff --git a/drivers/power/supply/max77705_charger.c b/drivers/power/supply/max77705_charger.c
+new file mode 100644
+index 000000000..e9bcaa2cf
+--- /dev/null
++++ b/drivers/power/supply/max77705_charger.c
+@@ -0,0 +1,924 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Based on max77650-charger.c
++ *
++ * Copyright (C) 2025 Dzmitry Sankouski <dsankouski@gmail.com>
++ *
++ * Battery charger driver for MAXIM 77705 charger/power-supply.
++ *
++ * Boot-042 R2 Safety Hardening (y2s / SM-G985F):
++ *   - Issue C: In-kernel fail-safe battery-pack thermal protection polling
++ *     max170xx_battery every 5s with y2s thresholds (stop >= 42.0 C or <= 0.0 C,
++ *     hysteresis recovery [2.0 C .. 40.0 C]), fail-safe disable if sensor is
++ *     missing, out-of-range, unreadable, or stale (> 30s).
++ *   - Issue D: Preserve hardware fast-charge safety timer (10h) and pre-qual
++ *     trickle charge; enforce DT/hardware current ceiling (<= 2.1 A), apply
++ *     conservative 1.0 A boot defaults, reject out-of-range sysfs writes with
++ *     -EINVAL, and fix CHGIN register step encoding.
++ */
++
++#include <linux/devm-helpers.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/mfd/max77693-common.h>
++#include <linux/mfd/max77705-private.h>
++#include <linux/power/max77705_charger.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++/* z3s backport: devm_alloc_ordered_workqueue landed upstream after this
++ * kernel base; provide an equivalent via a devm action. */
++static inline void z3s_destroy_wq(void *wq)
++{
++	destroy_workqueue(wq);
++}
++static inline struct workqueue_struct *
++z3s_devm_alloc_ordered_wq(struct device *dev, const char *name)
++{
++	struct workqueue_struct *wq = alloc_ordered_workqueue("%s", 0, name);
++
++	if (!wq)
++		return NULL;
++	if (devm_add_action_or_reset(dev, z3s_destroy_wq, wq))
++		return NULL;
++	return wq;
++}
++#undef devm_alloc_ordered_workqueue
++#define devm_alloc_ordered_workqueue(dev, fmt, flags, arg) \
++	z3s_devm_alloc_ordered_wq(dev, arg)
++
++static const char *max77705_charger_model		= "max77705";
++static const char *max77705_charger_manufacturer	= "Maxim Integrated";
++
++static const struct regmap_config max77705_chg_regmap_config = {
++	.reg_base = MAX77705_CHG_REG_BASE,
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = MAX77705_CHG_REG_SAFEOUT_CTRL,
++};
++
++static enum power_supply_property max77705_charger_props[] = {
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CHARGE_TYPE,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
++	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++};
++
++static irqreturn_t max77705_aicl_irq(int irq, void *irq_drv_data)
++{
++	struct max77705_charger_data *chg = irq_drv_data;
++	unsigned int regval, irq_status;
++	int err;
++
++	err = regmap_read(chg->regmap, MAX77705_CHG_REG_INT_OK, &irq_status);
++	if (err < 0)
++		return IRQ_HANDLED;
++
++	while (!(irq_status & BIT(MAX77705_AICL_I))) {
++		err = regmap_field_read(chg->rfield[MAX77705_CHG_CHGIN_LIM], &regval);
++		if (err < 0)
++			return IRQ_HANDLED;
++
++		if (regval <= 3)
++			break;
++
++		regval--;
++
++		err = regmap_field_write(chg->rfield[MAX77705_CHG_CHGIN_LIM], regval);
++		if (err < 0)
++			return IRQ_HANDLED;
++
++		msleep(AICL_WORK_DELAY_MS);
++
++		err = regmap_read(chg->regmap, MAX77705_CHG_REG_INT_OK, &irq_status);
++		if (err < 0)
++			return IRQ_HANDLED;
++	}
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t max77705_chgin_irq(int irq, void *irq_drv_data)
++{
++	struct max77705_charger_data *chg = irq_drv_data;
++
++	queue_work(chg->wqueue, &chg->chgin_work);
++
++	return IRQ_HANDLED;
++}
++
++static const struct regmap_irq max77705_charger_irqs[] = {
++	REGMAP_IRQ_REG_LINE(MAX77705_BYP_I, BITS_PER_BYTE),
++	REGMAP_IRQ_REG_LINE(MAX77705_INP_LIMIT_I, BITS_PER_BYTE),
++	REGMAP_IRQ_REG_LINE(MAX77705_BATP_I, BITS_PER_BYTE),
++	REGMAP_IRQ_REG_LINE(MAX77705_BAT_I, BITS_PER_BYTE),
++	REGMAP_IRQ_REG_LINE(MAX77705_CHG_I, BITS_PER_BYTE),
++	REGMAP_IRQ_REG_LINE(MAX77705_WCIN_I, BITS_PER_BYTE),
++	REGMAP_IRQ_REG_LINE(MAX77705_CHGIN_I, BITS_PER_BYTE),
++	REGMAP_IRQ_REG_LINE(MAX77705_AICL_I, BITS_PER_BYTE),
++};
++
++static const struct regmap_irq_chip max77705_charger_irq_chip = {
++	.name			= "max77705-charger",
++	.status_base		= MAX77705_CHG_REG_INT,
++	.mask_base		= MAX77705_CHG_REG_INT_MASK,
++	.num_regs		= 1,
++	.irqs			= max77705_charger_irqs,
++	.num_irqs		= ARRAY_SIZE(max77705_charger_irqs),
++};
++
++static int max77705_charger_set_enable_locked(struct max77705_charger_data *chg,
++					      bool enable)
++{
++	int rv;
++
++	rv = regmap_field_write(chg->rfield[MAX77705_CHG_EN],
++				enable ? 1 : MAX77705_CHG_DISABLE);
++	if (rv) {
++		dev_err(chg->dev, "unable to %s charger: %d\n",
++			enable ? "enable" : "disable", rv);
++		return rv;
++	}
++
++	chg->chg_enabled = enable;
++	return 0;
++}
++
++static void max77705_charger_disable_action(void *data)
++{
++	struct max77705_charger_data *chg = data;
++
++	mutex_lock(&chg->lock);
++	max77705_charger_set_enable_locked(chg, false);
++	mutex_unlock(&chg->lock);
++}
++
++static int max77705_get_online(struct regmap *regmap, int *val)
++{
++	unsigned int data;
++	int ret;
++
++	ret = regmap_read(regmap, MAX77705_CHG_REG_INT_OK, &data);
++	if (ret < 0)
++		return ret;
++
++	*val = !!(data & MAX77705_CHGIN_OK);
++
++	return 0;
++}
++
++static int max77705_set_cc_current_locked(struct max77705_charger_data *chg,
++					  int ua)
++{
++	unsigned int regval;
++
++	if (ua < MAX77705_CURRENT_CHGIN_MIN || ua > (int)chg->max_cc_ua)
++		return -EINVAL;
++
++	regval = ua / MAX77705_CURRENT_CHG_STEP;
++	return regmap_field_write(chg->rfield[MAX77705_CHG_CC_LIM], regval);
++}
++
++static int max77705_set_chgin_current_locked(struct max77705_charger_data *chg,
++					     int ua)
++{
++	unsigned int regval;
++
++	if (ua < MAX77705_CURRENT_CHGIN_MIN || ua > (int)chg->max_chgin_ua)
++		return -EINVAL;
++
++	/*
++	 * Matches max77705_get_input_current():
++	 *   reg_data <= 3 -> 100 mA
++	 *   reg_data >  3 -> (reg_data + 1) * 25 mA
++	 */
++	if (ua <= MAX77705_CURRENT_CHGIN_MIN)
++		regval = 3;
++	else
++		regval = (ua / MAX77705_CURRENT_CHGIN_STEP) - 1;
++
++	return regmap_field_write(chg->rfield[MAX77705_CHG_CHGIN_LIM], regval);
++}
++
++static int max77705_check_battery(struct max77705_charger_data *chg, int *val)
++{
++	unsigned int reg_data;
++	unsigned int reg_data2;
++	struct regmap *regmap = chg->regmap;
++
++	regmap_read(regmap, MAX77705_CHG_REG_INT_OK, &reg_data);
++	dev_dbg(chg->dev, "CHG_INT_OK(0x%x)\n", reg_data);
++
++	regmap_read(regmap, MAX77705_CHG_REG_DETAILS_00, &reg_data2);
++	dev_dbg(chg->dev, "CHG_DETAILS00(0x%x)\n", reg_data2);
++
++	if ((reg_data & MAX77705_BATP_OK) || !(reg_data2 & MAX77705_BATP_DTLS))
++		*val = true;
++	else
++		*val = false;
++
++	return 0;
++}
++
++static int max77705_get_charge_type(struct max77705_charger_data *chg, int *val)
++{
++	struct regmap *regmap = chg->regmap;
++	unsigned int reg_data, chg_en;
++
++	regmap_field_read(chg->rfield[MAX77705_CHG_EN], &chg_en);
++	if (!chg_en) {
++		*val = POWER_SUPPLY_CHARGE_TYPE_NONE;
++		return 0;
++	}
++
++	regmap_read(regmap, MAX77705_CHG_REG_DETAILS_01, &reg_data);
++	reg_data &= MAX77705_CHG_DTLS;
++
++	switch (reg_data) {
++	case 0x0:
++	case MAX77705_CHARGER_CONSTANT_CURRENT:
++	case MAX77705_CHARGER_CONSTANT_VOLTAGE:
++		*val = POWER_SUPPLY_CHARGE_TYPE_FAST;
++		return 0;
++	default:
++		*val = POWER_SUPPLY_CHARGE_TYPE_NONE;
++		return 0;
++	}
++}
++
++static int max77705_get_status(struct max77705_charger_data *chg, int *val)
++{
++	struct regmap *regmap = chg->regmap;
++	unsigned int reg_data, chg_en;
++
++	regmap_field_read(chg->rfield[MAX77705_CHG_EN], &chg_en);
++	if (!chg_en) {
++		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		return 0;
++	}
++
++	regmap_read(regmap, MAX77705_CHG_REG_DETAILS_01, &reg_data);
++	reg_data &= MAX77705_CHG_DTLS;
++
++	switch (reg_data) {
++	case 0x0:
++	case MAX77705_CHARGER_CONSTANT_CURRENT:
++	case MAX77705_CHARGER_CONSTANT_VOLTAGE:
++		*val = POWER_SUPPLY_STATUS_CHARGING;
++		return 0;
++	case MAX77705_CHARGER_END_OF_CHARGE:
++	case MAX77705_CHARGER_DONE:
++		*val = POWER_SUPPLY_STATUS_FULL;
++		return 0;
++	case 0x05:
++	case 0x06:
++	case 0x07:
++		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		return 0;
++	case 0x08:
++	case 0xA:
++	case 0xB:
++		*val = POWER_SUPPLY_STATUS_DISCHARGING;
++		return 0;
++	default:
++		*val = POWER_SUPPLY_STATUS_UNKNOWN;
++		return 0;
++	}
++}
++
++static int max77705_get_vbus_state(struct regmap *regmap, int *value)
++{
++	int ret;
++	unsigned int charge_dtls;
++
++	ret = regmap_read(regmap, MAX77705_CHG_REG_DETAILS_00, &charge_dtls);
++	if (ret)
++		return ret;
++
++	charge_dtls = ((charge_dtls & MAX77705_CHGIN_DTLS) >>
++			MAX77705_CHGIN_DTLS_SHIFT);
++
++	switch (charge_dtls) {
++	case 0x00:
++	case 0x01:
++		*value = POWER_SUPPLY_HEALTH_UNDERVOLTAGE;
++		break;
++	case 0x02:
++		*value = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
++		break;
++	case 0x03:
++		*value = POWER_SUPPLY_HEALTH_GOOD;
++		break;
++	default:
++		return 0;
++	}
++	return 0;
++}
++
++static int max77705_get_battery_health(struct max77705_charger_data *chg,
++					int *value)
++{
++	struct regmap *regmap = chg->regmap;
++	unsigned int bat_dtls;
++
++	if (chg->thermal_state == MAX77705_THERM_OVERHEAT) {
++		*value = POWER_SUPPLY_HEALTH_OVERHEAT;
++		return 0;
++	}
++	if (chg->thermal_state == MAX77705_THERM_COLD) {
++		*value = POWER_SUPPLY_HEALTH_COLD;
++		return 0;
++	}
++	if (chg->thermal_state == MAX77705_THERM_FAULT) {
++		*value = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
++		return 0;
++	}
++
++	regmap_read(regmap, MAX77705_CHG_REG_DETAILS_01, &bat_dtls);
++	bat_dtls = ((bat_dtls & MAX77705_BAT_DTLS) >> MAX77705_BAT_DTLS_SHIFT);
++
++	switch (bat_dtls) {
++	case MAX77705_BATTERY_NOBAT:
++		*value = POWER_SUPPLY_HEALTH_NO_BATTERY;
++		break;
++	case MAX77705_BATTERY_PREQUALIFICATION:
++		*value = POWER_SUPPLY_HEALTH_GOOD;
++		break;
++	case MAX77705_BATTERY_DEAD:
++		*value = POWER_SUPPLY_HEALTH_DEAD;
++		break;
++	case MAX77705_BATTERY_GOOD:
++	case MAX77705_BATTERY_LOWVOLTAGE:
++		*value = POWER_SUPPLY_HEALTH_GOOD;
++		break;
++	case MAX77705_BATTERY_OVERVOLTAGE:
++		*value = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
++		break;
++	default:
++		*value = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
++		break;
++	}
++
++	return 0;
++}
++
++static int max77705_get_health(struct max77705_charger_data *chg, int *val)
++{
++	struct regmap *regmap = chg->regmap;
++	int ret, is_online = 0;
++
++	ret = max77705_get_online(regmap, &is_online);
++	if (ret)
++		return ret;
++	if (is_online) {
++		ret = max77705_get_vbus_state(regmap, val);
++		if (ret || (*val != POWER_SUPPLY_HEALTH_GOOD))
++			return ret;
++	}
++	return max77705_get_battery_health(chg, val);
++}
++
++static int max77705_get_input_current(struct max77705_charger_data *chg,
++					int *val)
++{
++	unsigned int reg_data;
++	int get_current = 0;
++
++	regmap_field_read(chg->rfield[MAX77705_CHG_CHGIN_LIM], &reg_data);
++
++	if (reg_data <= 3)
++		get_current = MAX77705_CURRENT_CHGIN_MIN;
++	else
++		get_current = (reg_data + 1) * MAX77705_CURRENT_CHGIN_STEP;
++
++	*val = get_current;
++
++	return 0;
++}
++
++static int max77705_get_charge_current(struct max77705_charger_data *chg,
++					int *val)
++{
++	unsigned int reg_data;
++
++	regmap_field_read(chg->rfield[MAX77705_CHG_CC_LIM], &reg_data);
++
++	*val = reg_data <= 0x2 ? MAX77705_CURRENT_CHGIN_MIN : reg_data * MAX77705_CURRENT_CHG_STEP;
++
++	return 0;
++}
++
++static int max77705_set_float_voltage(struct max77705_charger_data *chg,
++					int float_voltage)
++{
++	int float_voltage_mv;
++	unsigned int reg_data = 0;
++
++	float_voltage_mv = float_voltage / 1000;
++	reg_data = float_voltage_mv <= 4000 ? 0x0 :
++		float_voltage_mv >= 4500 ? 0x23 :
++		(float_voltage_mv <= 4200) ? (float_voltage_mv - 4000) / 50 :
++		(((float_voltage_mv - 4200) / 10) + 0x04);
++
++	return regmap_field_write(chg->rfield[MAX77705_CHG_CV_PRM], reg_data);
++}
++
++static int max77705_get_float_voltage(struct max77705_charger_data *chg,
++					int *val)
++{
++	unsigned int reg_data = 0;
++	int voltage_mv;
++
++	regmap_field_read(chg->rfield[MAX77705_CHG_CV_PRM], &reg_data);
++	voltage_mv = reg_data <= 0x04 ? reg_data * 50 + 4000 :
++					(reg_data - 4) * 10 + 4200;
++	*val = voltage_mv * 1000;
++
++	return 0;
++}
++
++static int max77705_chg_get_property(struct power_supply *psy,
++					enum power_supply_property psp,
++					union power_supply_propval *val)
++{
++	struct max77705_charger_data *chg = power_supply_get_drvdata(psy);
++	struct regmap *regmap = chg->regmap;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_ONLINE:
++		return max77705_get_online(regmap, &val->intval);
++	case POWER_SUPPLY_PROP_PRESENT:
++		return max77705_check_battery(chg, &val->intval);
++	case POWER_SUPPLY_PROP_STATUS:
++		return max77705_get_status(chg, &val->intval);
++	case POWER_SUPPLY_PROP_CHARGE_TYPE:
++		return max77705_get_charge_type(chg, &val->intval);
++	case POWER_SUPPLY_PROP_HEALTH:
++		return max77705_get_health(chg, &val->intval);
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		return max77705_get_input_current(chg, &val->intval);
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
++		return max77705_get_charge_current(chg, &val->intval);
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		val->intval = chg->max_cc_ua;
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
++		return max77705_get_float_voltage(chg, &val->intval);
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		val->intval = chg->bat_info->voltage_max_design_uv;
++		break;
++	case POWER_SUPPLY_PROP_MODEL_NAME:
++		val->strval = max77705_charger_model;
++		break;
++	case POWER_SUPPLY_PROP_MANUFACTURER:
++		val->strval = max77705_charger_manufacturer;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int max77705_set_property(struct power_supply *psy,
++				 enum power_supply_property psp,
++				 const union power_supply_propval *val)
++{
++	struct max77705_charger_data *chg = power_supply_get_drvdata(psy);
++	int err;
++
++	mutex_lock(&chg->lock);
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
++		err = max77705_set_cc_current_locked(chg, val->intval);
++		break;
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		err = max77705_set_chgin_current_locked(chg, val->intval);
++		break;
++	default:
++		err = -EINVAL;
++		break;
++	}
++	mutex_unlock(&chg->lock);
++
++	return err;
++}
++
++static int max77705_property_is_writeable(struct power_supply *psy,
++					  enum power_supply_property psp)
++{
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static const struct power_supply_desc max77705_charger_psy_desc = {
++	.name = "max77705-charger",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.properties = max77705_charger_props,
++	.property_is_writeable = max77705_property_is_writeable,
++	.num_properties = ARRAY_SIZE(max77705_charger_props),
++	.get_property = max77705_chg_get_property,
++	.set_property = max77705_set_property,
++};
++
++static void max77705_chgin_isr_work(struct work_struct *work)
++{
++	struct max77705_charger_data *chg =
++		container_of(work, struct max77705_charger_data, chgin_work);
++
++	power_supply_changed(chg->psy_chg);
++}
++
++/*
++ * Fail-safe battery-pack thermal monitor:
++ * Queries live temperature from max170xx_battery (in deci-Celsius).
++ *   - Stop charging immediately if T >= 42.0 C or T <= 0.0 C.
++ *   - Resume charging ONLY inside hysteresis window [2.0 C .. 40.0 C].
++ *   - Fail-safe: if fuel gauge is missing, unreadable, out of sanity bounds
++ *     [-40.0 C .. 85.0 C], or stale (> 30 s), disable charging.
++ */
++static void max77705_thermal_check(struct max77705_charger_data *chg)
++{
++	struct power_supply *bat_psy;
++	union power_supply_propval prop;
++	enum max77705_thermal_state prev_state, next_state;
++	int temp_dc, ret;
++	bool allow_chg;
++
++	bat_psy = power_supply_get_by_name("max170xx_battery");
++
++	mutex_lock(&chg->lock);
++	prev_state = chg->thermal_state;
++
++	if (!bat_psy) {
++		if (!chg->has_valid_temp ||
++		    time_after(jiffies, chg->last_temp_jiffies +
++			       msecs_to_jiffies(MAX77705_TEMP_STALE_MS))) {
++			next_state = MAX77705_THERM_FAULT;
++			if (chg->chg_enabled || prev_state != next_state) {
++				dev_warn_ratelimited(chg->dev,
++					"thermal protection: fuel-gauge temperature unavailable, disabling charging\n");
++				max77705_charger_set_enable_locked(chg, false);
++			}
++			chg->thermal_state = next_state;
++			mutex_unlock(&chg->lock);
++			if (prev_state != next_state)
++				power_supply_changed(chg->psy_chg);
++			return;
++		}
++		mutex_unlock(&chg->lock);
++		return;
++	}
++
++	ret = power_supply_get_property(bat_psy, POWER_SUPPLY_PROP_TEMP, &prop);
++	power_supply_put(bat_psy);
++
++	if (ret < 0 || prop.intval < MAX77705_TEMP_SANITY_MIN_DC ||
++	    prop.intval > MAX77705_TEMP_SANITY_MAX_DC) {
++		next_state = MAX77705_THERM_FAULT;
++		if (chg->chg_enabled || prev_state != next_state) {
++			dev_warn_ratelimited(chg->dev,
++				"thermal protection: invalid battery temperature (ret=%d val=%d), disabling charging\n",
++				ret, prop.intval);
++			max77705_charger_set_enable_locked(chg, false);
++		}
++		chg->thermal_state = next_state;
++		mutex_unlock(&chg->lock);
++		if (prev_state != next_state)
++			power_supply_changed(chg->psy_chg);
++		return;
++	}
++
++	temp_dc = prop.intval;
++	chg->has_valid_temp = true;
++	chg->last_temp_dc = temp_dc;
++	chg->last_temp_jiffies = jiffies;
++
++	if (temp_dc >= MAX77705_TEMP_HIGH_STOP_DC) {
++		next_state = MAX77705_THERM_OVERHEAT;
++	} else if (temp_dc <= MAX77705_TEMP_LOW_STOP_DC) {
++		next_state = MAX77705_THERM_COLD;
++	} else if (prev_state == MAX77705_THERM_OVERHEAT &&
++		   temp_dc > MAX77705_TEMP_HIGH_RECOV_DC) {
++		next_state = MAX77705_THERM_OVERHEAT;
++	} else if (prev_state == MAX77705_THERM_COLD &&
++		   temp_dc < MAX77705_TEMP_LOW_RECOV_DC) {
++		next_state = MAX77705_THERM_COLD;
++	} else {
++		next_state = MAX77705_THERM_NORMAL;
++	}
++
++	allow_chg = (next_state == MAX77705_THERM_NORMAL);
++	if (!allow_chg && (chg->chg_enabled || prev_state != next_state)) {
++		dev_warn(chg->dev,
++			 "thermal protection: disabling charging (temp=%d.%d C, state=%d)\n",
++			 temp_dc / 10, abs(temp_dc % 10), next_state);
++		max77705_charger_set_enable_locked(chg, false);
++	} else if (allow_chg && !chg->chg_enabled) {
++		dev_info(chg->dev,
++			 "thermal protection: safe temperature (%d.%d C), enabling charging\n",
++			 temp_dc / 10, abs(temp_dc % 10));
++		max77705_charger_set_enable_locked(chg, true);
++	}
++
++	chg->thermal_state = next_state;
++	mutex_unlock(&chg->lock);
++
++	if (prev_state != next_state)
++		power_supply_changed(chg->psy_chg);
++}
++
++static int max77705_charger_initialize(struct max77705_charger_data *chg)
++{
++	struct power_supply_battery_info *info;
++	struct regmap *regmap = chg->regmap;
++	unsigned int init_cc_ua, init_chgin_ua;
++	int err;
++
++	err = power_supply_get_battery_info(chg->psy_chg, &info);
++	if (err)
++		return dev_err_probe(chg->dev, err, "error on getting battery info");
++
++	chg->bat_info = info;
++
++	/* Enforce validated y2s hardware & DT current ceilings */
++	if (info->constant_charge_current_max_ua > 0)
++		chg->max_cc_ua = min_t(unsigned int,
++				       info->constant_charge_current_max_ua,
++				       MAX77705_CURRENT_CC_MAX_SAFE);
++	else
++		chg->max_cc_ua = MAX77705_CURRENT_CC_DEFAULT;
++
++	chg->max_chgin_ua = min_t(unsigned int, chg->max_cc_ua,
++				  MAX77705_CURRENT_CHGIN_MAX_SAFE);
++
++	init_cc_ua = min_t(unsigned int, MAX77705_CURRENT_CC_DEFAULT, chg->max_cc_ua);
++	init_chgin_ua = min_t(unsigned int, MAX77705_CURRENT_CHGIN_DEFAULT, chg->max_chgin_ua);
++
++	/* Unlock charger setting protect; slowest LX slope */
++	err = regmap_field_write(chg->rfield[MAX77705_CHGPROT], MAX77705_CHGPROT_UNLOCKED);
++	if (err)
++		goto err;
++
++	err = regmap_field_write(chg->rfield[MAX77705_LX_SLOPE], MAX77705_SLOWEST_LX_SLOPE);
++	if (err)
++		goto err;
++
++	/*
++	 * Preserve hardware safety protections:
++	 *   - Fast-charge safety timer: 10 hours (FCHGTIME = 0x4)
++	 *   - Recharge threshold: 150 mV (CHG_RSTRT = 0x1)
++	 *   - Pre-qualification trickle charge: ENABLED (PQEN = 1)
++	 */
++	err = regmap_field_write(chg->rfield[MAX77705_FCHGTIME], MAX77705_FCHGTIME_10H);
++	if (err)
++		goto err;
++
++	err = regmap_field_write(chg->rfield[MAX77705_CHG_RSTRT], MAX77705_CHG_RSTRT_150MV);
++	if (err)
++		goto err;
++
++	err = regmap_field_write(chg->rfield[MAX77705_CHG_PQEN], MAX77705_CHG_PQEN_ENABLE);
++	if (err)
++		goto err;
++
++	err = regmap_field_write(chg->rfield[MAX77705_MODE],
++			MAX77705_CHG_MASK | MAX77705_BUCK_MASK);
++	if (err)
++		goto err;
++
++	/* Conservative boot-time fast-charge & CHGIN input current defaults */
++	err = max77705_set_cc_current_locked(chg, init_cc_ua);
++	if (err)
++		goto err;
++
++	err = max77705_set_chgin_current_locked(chg, init_chgin_ua);
++	if (err)
++		goto err;
++
++	/* OTG current limit 900mA */
++	err = regmap_field_write(chg->rfield[MAX77705_OTG_ILIM], MAX77705_OTG_ILIM_900);
++	if (err)
++		goto err;
++
++	/* BAT to SYS OCP 4.80A */
++	err = regmap_field_write(chg->rfield[MAX77705_REG_B2SOVRC], MAX77705_B2SOVRC_4_8A);
++	if (err)
++		goto err;
++
++	/* Top-off current 150mA, top-off timer 30min */
++	err = regmap_field_write(chg->rfield[MAX77705_TO], MAX77705_TO_ITH_150MA);
++	if (err)
++		goto err;
++
++	err = regmap_field_write(chg->rfield[MAX77705_TO_TIME], MAX77705_TO_TIME_30M);
++	if (err)
++		goto err;
++
++	err = regmap_field_write(chg->rfield[MAX77705_SYS_TRACK], MAX77705_SYS_TRACK_DISABLE);
++	if (err)
++		goto err;
++
++	/* Float voltage from DT (y2s: 4.38 V); conservative 4.2 V fallback */
++	if (info->voltage_max_design_uv < 0) {
++		dev_warn(chg->dev, "missing battery:voltage-max-design-microvolt, using 4.2V\n");
++		err = max77705_set_float_voltage(chg, 4200000);
++	} else {
++		err = max77705_set_float_voltage(chg, info->voltage_max_design_uv);
++	}
++	if (err)
++		goto err;
++
++	err = regmap_field_write(chg->rfield[MAX77705_VCHGIN], MAX77705_VCHGIN_4_5);
++	if (err)
++		goto err;
++
++	err = regmap_field_write(chg->rfield[MAX77705_WCIN], MAX77705_WCIN_4_5);
++	if (err)
++		goto err;
++
++	/* Watchdog timer disabled (no userspace WDT kicker; FCHGTIME=10h active) */
++	regmap_update_bits(regmap, MAX77705_CHG_REG_CNFG_00,
++			   MAX77705_WDTEN_MASK, 0);
++
++	/* VBYPSET=5.0V */
++	err = regmap_field_write(chg->rfield[MAX77705_VBYPSET], 0);
++	if (err)
++		goto err;
++
++	/* Switching Frequency : 1.5MHz */
++	err = regmap_field_write(chg->rfield[MAX77705_REG_FSW], MAX77705_CHG_FSW_1_5MHz);
++	if (err)
++		goto err;
++
++	/* Auto skip mode */
++	err = regmap_field_write(chg->rfield[MAX77705_REG_DISKIP], MAX77705_AUTO_SKIP);
++	if (err)
++		goto err;
++
++	/* Start with charging disabled until thermal safety check succeeds */
++	err = max77705_charger_set_enable_locked(chg, false);
++	if (err)
++		goto err;
++
++	dev_info(chg->dev,
++		 "max77705 initialized: cc=%u uA chgin=%u uA max=%u uA fchgtime=10h pqen=1 thermal=[0.0..42.0 C]\n",
++		 init_cc_ua, init_chgin_ua, chg->max_cc_ua);
++
++	return 0;
++
++err:
++	return dev_err_probe(chg->dev, err, "error while configuring");
++}
++
++#define MAX77705_POLL_INTERVAL_MS 5000
++
++static void max77705_poll_work(struct work_struct *work)
++{
++	struct max77705_charger_data *chg =
++		container_of(work, struct max77705_charger_data, poll_work.work);
++	int online = 0;
++
++	max77705_thermal_check(chg);
++
++	if (!max77705_get_online(chg->regmap, &online) &&
++	    online != chg->last_online) {
++		chg->last_online = online;
++		power_supply_changed(chg->psy_chg);
++	}
++	schedule_delayed_work(&chg->poll_work,
++			      msecs_to_jiffies(MAX77705_POLL_INTERVAL_MS));
++}
++
++static int max77705_charger_probe(struct i2c_client *i2c)
++{
++	struct power_supply_config pscfg = {};
++	struct max77705_charger_data *chg;
++	struct regmap_irq_chip *chip_desc;
++	struct device *dev;
++	struct regmap_irq_chip_data *irq_data = NULL;
++	int ret;
++
++	dev = &i2c->dev;
++
++	chg = devm_kzalloc(dev, sizeof(*chg), GFP_KERNEL);
++	if (!chg)
++		return -ENOMEM;
++
++	chg->dev = dev;
++	chg->thermal_state = MAX77705_THERM_UNKNOWN;
++	chg->last_online = -1;
++	mutex_init(&chg->lock);
++	i2c_set_clientdata(i2c, chg);
++
++	chip_desc = devm_kmemdup(dev, &max77705_charger_irq_chip,
++				 sizeof(max77705_charger_irq_chip),
++				 GFP_KERNEL);
++	if (!chip_desc)
++		return -ENOMEM;
++	chip_desc->irq_drv_data = chg;
++
++	chg->regmap = devm_regmap_init_i2c(i2c, &max77705_chg_regmap_config);
++	if (IS_ERR(chg->regmap))
++		return PTR_ERR(chg->regmap);
++
++	for (int i = 0; i < MAX77705_N_REGMAP_FIELDS; i++) {
++		chg->rfield[i] = devm_regmap_field_alloc(dev, chg->regmap,
++							 max77705_reg_field[i]);
++		if (IS_ERR(chg->rfield[i]))
++			return dev_err_probe(dev, PTR_ERR(chg->rfield[i]),
++					     "cannot allocate regmap field\n");
++	}
++
++	pscfg.fwnode = dev_fwnode(dev);
++	pscfg.drv_data = chg;
++
++	chg->psy_chg = devm_power_supply_register(dev, &max77705_charger_psy_desc, &pscfg);
++	if (IS_ERR(chg->psy_chg))
++		return PTR_ERR(chg->psy_chg);
++
++	if (i2c->irq > 0) {
++		ret = devm_regmap_add_irq_chip(chg->dev, chg->regmap, i2c->irq,
++						IRQF_ONESHOT, 0,
++						chip_desc, &irq_data);
++		if (ret)
++			return dev_err_probe(dev, ret, "failed to add irq chip\n");
++
++		chg->wqueue = devm_alloc_ordered_workqueue(dev, "%s", 0, dev_name(dev));
++		if (!chg->wqueue)
++			return -ENOMEM;
++
++		ret = devm_work_autocancel(dev, &chg->chgin_work, max77705_chgin_isr_work);
++		if (ret)
++			return dev_err_probe(dev, ret, "failed to initialize interrupt work\n");
++	}
++
++	mutex_lock(&chg->lock);
++	ret = max77705_charger_initialize(chg);
++	mutex_unlock(&chg->lock);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to initialize charger IC\n");
++
++	if (i2c->irq > 0) {
++		ret = devm_request_threaded_irq(dev, regmap_irq_get_virq(irq_data, MAX77705_CHGIN_I),
++						NULL, max77705_chgin_irq,
++						IRQF_TRIGGER_NONE,
++						"chgin-irq", chg);
++		if (ret)
++			return ret;
++
++		ret = devm_request_threaded_irq(dev, regmap_irq_get_virq(irq_data, MAX77705_AICL_I),
++						NULL, max77705_aicl_irq,
++						IRQF_TRIGGER_NONE,
++						"aicl-irq", chg);
++		if (ret)
++			return ret;
++	}
++
++	/* Perform initial fail-safe thermal check before enabling charging */
++	max77705_thermal_check(chg);
++
++	/* Always run 5-second poll loop for thermal protection & CHGIN status */
++	ret = devm_delayed_work_autocancel(dev, &chg->poll_work,
++					   max77705_poll_work);
++	if (ret)
++		return ret;
++	schedule_delayed_work(&chg->poll_work,
++			      msecs_to_jiffies(MAX77705_POLL_INTERVAL_MS));
++
++	return devm_add_action_or_reset(dev, max77705_charger_disable_action, chg);
++}
++
++static const struct of_device_id max77705_charger_of_match[] = {
++	{ .compatible = "maxim,max77705-charger" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, max77705_charger_of_match);
++
++static struct i2c_driver max77705_charger_driver = {
++	.driver = {
++		.name = "max77705-charger",
++		.of_match_table = max77705_charger_of_match,
++	},
++	.probe = max77705_charger_probe,
++};
++module_i2c_driver(max77705_charger_driver);
++
++MODULE_AUTHOR("Dzmitry Sankouski <dsankouski@gmail.com>");
++MODULE_DESCRIPTION("Maxim MAX77705 charger driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/power/supply/power_supply_sysfs.c b/drivers/power/supply/power_supply_sysfs.c
+index 16b3c5880..75782b833 100644
+--- a/drivers/power/supply/power_supply_sysfs.c
++++ b/drivers/power/supply/power_supply_sysfs.c
+@@ -109,6 +109,7 @@ static const char * const POWER_SUPPLY_HEALTH_TEXT[] = {
+ 	[POWER_SUPPLY_HEALTH_COOL]		    = "Cool",
+ 	[POWER_SUPPLY_HEALTH_HOT]		    = "Hot",
+ 	[POWER_SUPPLY_HEALTH_NO_BATTERY]	    = "No battery",
++	[POWER_SUPPLY_HEALTH_UNDERVOLTAGE]	    = "Under voltage",
+ };
+ 
+ static const char * const POWER_SUPPLY_TECHNOLOGY_TEXT[] = {
+diff --git a/include/linux/firmware/samsung/exynos-acpm-protocol.h b/include/linux/firmware/samsung/exynos-acpm-protocol.h
+new file mode 100644
+index 000000000..c6b35c0ff
+--- /dev/null
++++ b/include/linux/firmware/samsung/exynos-acpm-protocol.h
+@@ -0,0 +1,74 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright 2020 Samsung Electronics Co., Ltd.
++ * Copyright 2020 Google LLC.
++ * Copyright 2024 Linaro Ltd.
++ */
++
++#ifndef __EXYNOS_ACPM_PROTOCOL_H
++#define __EXYNOS_ACPM_PROTOCOL_H
++
++#include <linux/types.h>
++
++struct acpm_handle;
++struct device_node;
++
++struct acpm_dvfs_ops {
++	int (*set_rate)(struct acpm_handle *handle, unsigned int acpm_chan_id,
++			unsigned int clk_id, unsigned long rate);
++	unsigned long (*get_rate)(struct acpm_handle *handle,
++				  unsigned int acpm_chan_id,
++				  unsigned int clk_id);
++};
++
++struct acpm_pmic_ops {
++	int (*read_reg)(struct acpm_handle *handle, unsigned int acpm_chan_id,
++			u8 type, u8 reg, u8 chan, u8 *buf);
++	int (*bulk_read)(struct acpm_handle *handle, unsigned int acpm_chan_id,
++			 u8 type, u8 reg, u8 chan, u8 count, u8 *buf);
++	int (*write_reg)(struct acpm_handle *handle, unsigned int acpm_chan_id,
++			 u8 type, u8 reg, u8 chan, u8 value);
++	int (*bulk_write)(struct acpm_handle *handle, unsigned int acpm_chan_id,
++			  u8 type, u8 reg, u8 chan, u8 count, const u8 *buf);
++	int (*update_reg)(struct acpm_handle *handle, unsigned int acpm_chan_id,
++			  u8 type, u8 reg, u8 chan, u8 value, u8 mask);
++};
++
++struct acpm_tmu_ops {
++	int (*init)(struct acpm_handle *handle, unsigned int acpm_chan_id);
++	int (*read_temp)(struct acpm_handle *handle, unsigned int acpm_chan_id,
++			 u8 tz, int *temp);
++	int (*set_threshold)(struct acpm_handle *handle,
++			     unsigned int acpm_chan_id, u8 tz,
++			     const u8 temperature[8], size_t tlen);
++	int (*set_interrupt_enable)(struct acpm_handle *handle,
++				    unsigned int acpm_chan_id, u8 tz, u8 inten);
++	int (*tz_control)(struct acpm_handle *handle, unsigned int acpm_chan_id,
++			  u8 tz, bool enable);
++	int (*clear_tz_irq)(struct acpm_handle *handle,
++			    unsigned int acpm_chan_id, u8 tz);
++	int (*suspend)(struct acpm_handle *handle, unsigned int acpm_chan_id);
++	int (*resume)(struct acpm_handle *handle, unsigned int acpm_chan_id);
++};
++
++struct acpm_ops {
++	struct acpm_dvfs_ops dvfs;
++	struct acpm_pmic_ops pmic;
++	struct acpm_tmu_ops tmu;
++};
++
++/**
++ * struct acpm_handle - Reference to an initialized protocol instance
++ * @ops:	pointer to the constant ACPM protocol operations.
++ */
++struct acpm_handle {
++	const struct acpm_ops *ops;
++};
++
++struct device;
++
++struct acpm_handle *devm_acpm_get_by_node(struct device *dev,
++					  struct device_node *np);
++struct acpm_handle *devm_acpm_get_by_phandle(struct device *dev);
++
++#endif /* __EXYNOS_ACPM_PROTOCOL_H */
+diff --git a/include/linux/mailbox/exynos-message.h b/include/linux/mailbox/exynos-message.h
+new file mode 100644
+index 000000000..5a9ed5ce2
+--- /dev/null
++++ b/include/linux/mailbox/exynos-message.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Exynos mailbox message.
++ *
++ * Copyright 2024 Linaro Ltd.
++ */
++
++#ifndef _LINUX_EXYNOS_MESSAGE_H_
++#define _LINUX_EXYNOS_MESSAGE_H_
++
++#define EXYNOS_MBOX_CHAN_TYPE_DOORBELL		0
++#define EXYNOS_MBOX_CHAN_TYPE_DATA		1
++
++struct exynos_mbox_msg {
++	unsigned int chan_id;
++	unsigned int chan_type;
++};
++
++#endif /* _LINUX_EXYNOS_MESSAGE_H_ */
+diff --git a/include/linux/mfd/max77705-private.h b/include/linux/mfd/max77705-private.h
+new file mode 100644
+index 000000000..214de7fee
+--- /dev/null
++++ b/include/linux/mfd/max77705-private.h
+@@ -0,0 +1,195 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Maxim MAX77705 definitions.
++ *
++ * Copyright (C) 2015 Samsung Electronics, Inc.
++ * Copyright (C) 2025 Dzmitry Sankouski <dsankouski@gmail.com>
++ */
++
++#ifndef __LINUX_MFD_MAX77705_PRIV_H
++#define __LINUX_MFD_MAX77705_PRIV_H
++
++#define MAX77705_SRC_IRQ_CHG	BIT(0)
++#define MAX77705_SRC_IRQ_TOP	BIT(1)
++#define MAX77705_SRC_IRQ_FG	BIT(2)
++#define MAX77705_SRC_IRQ_USBC	BIT(3)
++#define MAX77705_SRC_IRQ_ALL	(MAX77705_SRC_IRQ_CHG | MAX77705_SRC_IRQ_TOP | \
++				MAX77705_SRC_IRQ_FG | MAX77705_SRC_IRQ_USBC)
++
++/* MAX77705_PMIC_REG_PMICREV register */
++#define MAX77705_VERSION_SHIFT	3
++#define MAX77705_REVISION_MASK	GENMASK(2, 0)
++#define MAX77705_VERSION_MASK	GENMASK(7, MAX77705_VERSION_SHIFT)
++/* MAX77705_PMIC_REG_MAINCTRL1 register */
++#define MAX77705_MAINCTRL1_BIASEN_SHIFT	7
++#define MAX77705_MAINCTRL1_BIASEN_MASK	BIT(MAX77705_MAINCTRL1_BIASEN_SHIFT)
++/* MAX77705_PMIC_REG_MCONFIG2 (haptics) register */
++#define MAX77705_CONFIG2_MEN_SHIFT	6
++#define MAX77705_CONFIG2_MODE_SHIFT	7
++#define MAX77705_CONFIG2_HTYP_SHIFT	5
++/* MAX77705_PMIC_REG_SYSTEM_INT_MASK register */
++#define MAX77705_SYSTEM_IRQ_BSTEN_INT	BIT(3)
++#define MAX77705_SYSTEM_IRQ_SYSUVLO_INT	BIT(4)
++#define MAX77705_SYSTEM_IRQ_SYSOVLO_INT	BIT(5)
++#define MAX77705_SYSTEM_IRQ_TSHDN_INT	BIT(6)
++#define MAX77705_SYSTEM_IRQ_TM_INT	BIT(7)
++/* MAX77705_RGBLED_REG_LEDEN register */
++#define MAX77705_RGBLED_EN_WIDTH	2
++/* MAX77705_RGBLED_REG_LEDBLNK register */
++#define MAX77705_RGB_DELAY_100_STEP_LIM 500
++#define MAX77705_RGB_DELAY_100_STEP_COUNT 4
++#define MAX77705_RGB_DELAY_100_STEP 100
++#define MAX77705_RGB_DELAY_250_STEP_LIM 3250
++#define MAX77705_RGB_DELAY_250_STEP 250
++#define MAX77705_RGB_DELAY_500_STEP 500
++#define MAX77705_RGB_DELAY_500_STEP_COUNT 10
++#define MAX77705_RGB_DELAY_500_STEP_LIM 5000
++#define MAX77705_RGB_DELAY_1000_STEP_LIM 8000
++#define MAX77705_RGB_DELAY_1000_STEP_COUNT 13
++#define MAX77705_RGB_DELAY_1000_STEP 1000
++#define MAX77705_RGB_DELAY_2000_STEP 2000
++#define MAX77705_RGB_DELAY_2000_STEP_COUNT 13
++#define MAX77705_RGB_DELAY_2000_STEP_LIM 12000
++
++enum max77705_hw_rev {
++	MAX77705_PASS1 = 1,
++	MAX77705_PASS2,
++	MAX77705_PASS3
++};
++
++enum max77705_reg {
++	MAX77705_PMIC_REG_PMICID1		= 0x00,
++	MAX77705_PMIC_REG_PMICREV		= 0x01,
++	MAX77705_PMIC_REG_MAINCTRL1		= 0x02,
++	MAX77705_PMIC_REG_BSTOUT_MASK		= 0x03,
++	MAX77705_PMIC_REG_FORCE_EN_MASK		= 0x08,
++	MAX77705_PMIC_REG_MCONFIG		= 0x10,
++	MAX77705_PMIC_REG_MCONFIG2		= 0x11,
++	MAX77705_PMIC_REG_INTSRC		= 0x22,
++	MAX77705_PMIC_REG_INTSRC_MASK		= 0x23,
++	MAX77705_PMIC_REG_SYSTEM_INT		= 0x24,
++	MAX77705_PMIC_REG_RESERVED_25		= 0x25,
++	MAX77705_PMIC_REG_SYSTEM_INT_MASK	= 0x26,
++	MAX77705_PMIC_REG_RESERVED_27		= 0x27,
++	MAX77705_PMIC_REG_RESERVED_28		= 0x28,
++	MAX77705_PMIC_REG_RESERVED_29		= 0x29,
++	MAX77705_PMIC_REG_BOOSTCONTROL1		= 0x4C,
++	MAX77705_PMIC_REG_BOOSTCONTROL2		= 0x4F,
++	MAX77705_PMIC_REG_SW_RESET		= 0x50,
++	MAX77705_PMIC_REG_USBC_RESET		= 0x51,
++
++	MAX77705_PMIC_REG_END
++};
++
++enum max77705_chg_reg {
++	MAX77705_CHG_REG_BASE			= 0xB0,
++	MAX77705_CHG_REG_INT			= 0,
++	MAX77705_CHG_REG_INT_MASK,
++	MAX77705_CHG_REG_INT_OK,
++	MAX77705_CHG_REG_DETAILS_00,
++	MAX77705_CHG_REG_DETAILS_01,
++	MAX77705_CHG_REG_DETAILS_02,
++	MAX77705_CHG_REG_DTLS_03,
++	MAX77705_CHG_REG_CNFG_00,
++	MAX77705_CHG_REG_CNFG_01,
++	MAX77705_CHG_REG_CNFG_02,
++	MAX77705_CHG_REG_CNFG_03,
++	MAX77705_CHG_REG_CNFG_04,
++	MAX77705_CHG_REG_CNFG_05,
++	MAX77705_CHG_REG_CNFG_06,
++	MAX77705_CHG_REG_CNFG_07,
++	MAX77705_CHG_REG_CNFG_08,
++	MAX77705_CHG_REG_CNFG_09,
++	MAX77705_CHG_REG_CNFG_10,
++	MAX77705_CHG_REG_CNFG_11,
++
++	MAX77705_CHG_REG_CNFG_12,
++	MAX77705_CHG_REG_CNFG_13,
++	MAX77705_CHG_REG_CNFG_14,
++	MAX77705_CHG_REG_SAFEOUT_CTRL
++};
++
++enum max77705_fuelgauge_reg {
++	STATUS_REG				= 0x00,
++	VALRT_THRESHOLD_REG			= 0x01,
++	TALRT_THRESHOLD_REG			= 0x02,
++	SALRT_THRESHOLD_REG			= 0x03,
++	REMCAP_REP_REG				= 0x05,
++	SOCREP_REG				= 0x06,
++	TEMPERATURE_REG				= 0x08,
++	VCELL_REG				= 0x09,
++	TIME_TO_EMPTY_REG			= 0x11,
++	FULLSOCTHR_REG				= 0x13,
++	CURRENT_REG				= 0x0A,
++	AVG_CURRENT_REG				= 0x0B,
++	SOCMIX_REG				= 0x0D,
++	SOCAV_REG				= 0x0E,
++	REMCAP_MIX_REG				= 0x0F,
++	FULLCAP_REG				= 0x10,
++	RFAST_REG				= 0x15,
++	AVR_TEMPERATURE_REG			= 0x16,
++	CYCLES_REG				= 0x17,
++	DESIGNCAP_REG				= 0x18,
++	AVR_VCELL_REG				= 0x19,
++	TIME_TO_FULL_REG			= 0x20,
++	CONFIG_REG				= 0x1D,
++	ICHGTERM_REG				= 0x1E,
++	REMCAP_AV_REG				= 0x1F,
++	FULLCAP_NOM_REG				= 0x23,
++	LEARN_CFG_REG				= 0x28,
++	FILTER_CFG_REG				= 0x29,
++	MISCCFG_REG				= 0x2B,
++	QRTABLE20_REG				= 0x32,
++	FULLCAP_REP_REG				= 0x35,
++	RCOMP_REG				= 0x38,
++	VEMPTY_REG				= 0x3A,
++	FSTAT_REG				= 0x3D,
++	DISCHARGE_THRESHOLD_REG			= 0x40,
++	QRTABLE30_REG				= 0x42,
++	ISYS_REG				= 0x43,
++	DQACC_REG				= 0x45,
++	DPACC_REG				= 0x46,
++	AVGISYS_REG				= 0x4B,
++	QH_REG					= 0x4D,
++	VSYS_REG				= 0xB1,
++	TALRTTH2_REG				= 0xB2,
++	VBYP_REG				= 0xB3,
++	CONFIG2_REG				= 0xBB,
++	IIN_REG					= 0xD0,
++	OCV_REG					= 0xEE,
++	VFOCV_REG				= 0xFB,
++	VFSOC_REG				= 0xFF,
++
++	MAX77705_FG_END
++};
++
++enum max77705_led_reg {
++	MAX77705_RGBLED_REG_BASE		= 0x30,
++	MAX77705_RGBLED_REG_LEDEN		= 0,
++	MAX77705_RGBLED_REG_LED0BRT,
++	MAX77705_RGBLED_REG_LED1BRT,
++	MAX77705_RGBLED_REG_LED2BRT,
++	MAX77705_RGBLED_REG_LED3BRT,
++	MAX77705_RGBLED_REG_LEDRMP,
++	MAX77705_RGBLED_REG_LEDBLNK,
++	MAX77705_LED_REG_END
++};
++
++enum max77705_charger_battery_state {
++	MAX77705_BATTERY_NOBAT,
++	MAX77705_BATTERY_PREQUALIFICATION,
++	MAX77705_BATTERY_DEAD,
++	MAX77705_BATTERY_GOOD,
++	MAX77705_BATTERY_LOWVOLTAGE,
++	MAX77705_BATTERY_OVERVOLTAGE,
++	MAX77705_BATTERY_RESERVED
++};
++
++enum max77705_charger_charge_type {
++	MAX77705_CHARGER_CONSTANT_CURRENT	= 1,
++	MAX77705_CHARGER_CONSTANT_VOLTAGE,
++	MAX77705_CHARGER_END_OF_CHARGE,
++	MAX77705_CHARGER_DONE
++};
++
++#endif /* __LINUX_MFD_MAX77705_PRIV_H */
+diff --git a/include/linux/power/max77705_charger.h b/include/linux/power/max77705_charger.h
+new file mode 100644
+index 000000000..42b1fb84f
+--- /dev/null
++++ b/include/linux/power/max77705_charger.h
+@@ -0,0 +1,232 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Maxim MAX77705 definitions.
++ *
++ * Copyright (C) 2015 Samsung Electronics, Inc.
++ * Copyright (C) 2025 Dzmitry Sankouski <dsankouski@gmail.com>
++ *
++ * Boot-042 R2 Safety Hardening (y2s / SM-G985F):
++ *   - Hardware fast-charge safety timer encoding (FCHGTIME = 4h..16h).
++ *   - Conservative y2s current ceilings & boot defaults.
++ *   - Fail-safe battery-pack thermal protection state & mutex.
++ */
++
++#ifndef __MAX77705_CHARGER_H
++#define __MAX77705_CHARGER_H __FILE__
++
++#include <linux/mutex.h>
++#include <linux/regmap.h>
++
++/* MAX77705_CHG_REG_CHG_INT */
++#define MAX77705_BYP_I		(0)
++#define MAX77705_INP_LIMIT_I	(1)
++#define MAX77705_BATP_I		(2)
++#define MAX77705_BAT_I		(3)
++#define MAX77705_CHG_I		(4)
++#define MAX77705_WCIN_I		(5)
++#define MAX77705_CHGIN_I	(6)
++#define MAX77705_AICL_I		(7)
++
++/* MAX77705_CHG_REG_CHG_INT_OK */
++#define MAX77705_BYP_OK		BIT(MAX77705_BYP_I)
++#define MAX77705_DISQBAT_OK	BIT(MAX77705_INP_LIMIT_I)
++#define MAX77705_BATP_OK	BIT(MAX77705_BATP_I)
++#define MAX77705_BAT_OK		BIT(MAX77705_BAT_I)
++#define MAX77705_CHG_OK		BIT(MAX77705_CHG_I)
++#define MAX77705_WCIN_OK	BIT(MAX77705_WCIN_I)
++#define MAX77705_CHGIN_OK	BIT(MAX77705_CHGIN_I)
++#define MAX77705_AICL_OK	BIT(MAX77705_AICL_I)
++
++/* MAX77705_CHG_REG_DETAILS_00 */
++#define MAX77705_BATP_DTLS		BIT(0)
++#define MAX77705_WCIN_DTLS		GENMASK(4, 3)
++#define MAX77705_WCIN_DTLS_SHIFT	3
++#define MAX77705_CHGIN_DTLS		GENMASK(6, 5)
++#define MAX77705_CHGIN_DTLS_SHIFT	5
++
++/* MAX77705_CHG_REG_DETAILS_01 */
++#define MAX77705_CHG_DTLS	GENMASK(3, 0)
++#define MAX77705_CHG_DTLS_SHIFT	0
++#define MAX77705_BAT_DTLS	GENMASK(6, 4)
++#define MAX77705_BAT_DTLS_SHIFT	4
++
++/* MAX77705_CHG_REG_DETAILS_02 */
++#define MAX77705_BYP_DTLS	GENMASK(3, 0)
++#define MAX77705_BYP_DTLS_SHIFT	0
++
++/* MAX77705_CHG_REG_CNFG_00 */
++#define MAX77705_CHG_SHIFT	0
++#define MAX77705_UNO_SHIFT	1
++#define MAX77705_OTG_SHIFT	1
++#define MAX77705_BUCK_SHIFT	2
++#define MAX77705_BOOST_SHIFT	3
++#define MAX77705_WDTEN_SHIFT	4
++#define MAX77705_CHG_MASK	BIT(MAX77705_CHG_SHIFT)
++#define MAX77705_UNO_MASK	BIT(MAX77705_UNO_SHIFT)
++#define MAX77705_OTG_MASK	BIT(MAX77705_OTG_SHIFT)
++#define MAX77705_BUCK_MASK	BIT(MAX77705_BUCK_SHIFT)
++#define MAX77705_BOOST_MASK	BIT(MAX77705_BOOST_SHIFT)
++#define MAX77705_WDTEN_MASK	BIT(MAX77705_WDTEN_SHIFT)
++#define MAX77705_UNO_CTRL	(MAX77705_UNO_MASK | MAX77705_BOOST_MASK)
++#define MAX77705_OTG_CTRL	(MAX77705_OTG_MASK | MAX77705_BOOST_MASK)
++
++/* MAX77705_CHG_REG_CNFG_01: FCHGTIME [2:0] = 4h + (val - 1) * 2h */
++#define MAX77705_FCHGTIME_4H		0x1
++#define MAX77705_FCHGTIME_6H		0x2
++#define MAX77705_FCHGTIME_8H		0x3
++#define MAX77705_FCHGTIME_10H		0x4
++#define MAX77705_FCHGTIME_12H		0x5
++#define MAX77705_CHG_RSTRT_150MV	0x1
++#define MAX77705_CHG_RSTRT_DISABLE	0x3
++
++#define MAX77705_CHG_PQEN_DISABLE	0
++#define MAX77705_CHG_PQEN_ENABLE	1
++
++/* MAX77705_CHG_REG_CNFG_02 */
++#define MAX77705_OTG_ILIM_500		0
++#define MAX77705_OTG_ILIM_900		1
++#define MAX77705_OTG_ILIM_1200		2
++#define MAX77705_OTG_ILIM_1500		3
++
++/* MAX77705_CHG_REG_CNFG_03 */
++#define MAX77705_TO_ITH_150MA		0
++#define MAX77705_TO_TIME_30M		3
++#define MAX77705_SYS_TRACK_ENABLE	0
++#define MAX77705_SYS_TRACK_DISABLE	1
++
++/* MAX77705_CHG_REG_CNFG_04 */
++#define MAX77705_CHG_MINVSYS_SHIFT	6
++#define MAX77705_CHG_MINVSYS_MASK	GENMASK(7, 6)
++
++/* MAX77705_CHG_REG_CNFG_05 */
++#define MAX77705_B2SOVRC_DISABLE	0
++#define MAX77705_B2SOVRC_4_5A		6
++#define MAX77705_B2SOVRC_4_8A		8
++#define MAX77705_B2SOVRC_5_0A		9
++
++/* MAX77705_CHG_CNFG_06 */
++#define MAX77705_WDTCLR_SHIFT		0
++#define MAX77705_WDTCLR_MASK		GENMASK(1, 0)
++#define MAX77705_WDTCLR			1
++#define MAX77705_CHGPROT_UNLOCKED	3
++#define MAX77705_SLOWEST_LX_SLOPE	3
++
++/* MAX77705_CHG_REG_CNFG_07 */
++#define MAX77705_CHG_FMBST		4
++#define MAX77705_REG_FMBST_SHIFT	2
++#define MAX77705_REG_FMBST_MASK		BIT(MAX77705_REG_FMBST_SHIFT)
++#define MAX77705_REG_FGSRC_SHIFT	1
++#define MAX77705_REG_FGSRC_MASK		BIT(MAX77705_REG_FGSRC_SHIFT)
++
++/* MAX77705_CHG_REG_CNFG_08 */
++#define MAX77705_CHG_FSW_3MHz		0
++#define MAX77705_CHG_FSW_2MHz		1
++#define MAX77705_CHG_FSW_1_5MHz		2
++
++/* MAX77705_CHG_REG_CNFG_09 */
++#define MAX77705_CHG_DISABLE		0
++
++/* MAX77705_CHG_REG_CNFG_12 */
++#define MAX77705_VCHGIN_4_5		0
++#define MAX77705_WCIN_4_5		0
++#define MAX77705_DISABLE_SKIP		1
++#define MAX77705_AUTO_SKIP		0
++
++#define AICL_WORK_DELAY_MS		100
++
++/* Current limits in uA (validated for SM-G985F / y2s) */
++#define MAX77705_CURRENT_CHGIN_STEP	25000
++#define MAX77705_CURRENT_CHG_STEP	50000
++#define MAX77705_CURRENT_CHGIN_MIN	100000
++#define MAX77705_CURRENT_CC_MAX_SAFE	2100000	/* y2s DT constant-charge-current-max */
++#define MAX77705_CURRENT_CHGIN_MAX_SAFE	2100000	/* conservative hard ceiling */
++#define MAX77705_CURRENT_CC_DEFAULT	1000000	/* 1.0 A conservative server default */
++#define MAX77705_CURRENT_CHGIN_DEFAULT	1000000	/* 1.0 A matching y2s chg_input_limit_current */
++
++/* Battery-pack thermal protection thresholds in deci-Celsius (y2s-original.dts) */
++#define MAX77705_TEMP_HIGH_STOP_DC	420	/* 42.0 C (swelling_high_temp_block = 0x1a4) */
++#define MAX77705_TEMP_HIGH_RECOV_DC	400	/* 40.0 C (swelling_high_temp_recov = 0x190) */
++#define MAX77705_TEMP_LOW_STOP_DC	0	/* 0.0 C  (temp_low_threshold_normal = 0x00) */
++#define MAX77705_TEMP_LOW_RECOV_DC	20	/* 2.0 C  (temp_low_recovery_normal = 0x14) */
++#define MAX77705_TEMP_SANITY_MIN_DC	(-400)	/* -40.0 C thermistor open fault */
++#define MAX77705_TEMP_SANITY_MAX_DC	850	/*  85.0 C thermistor short fault */
++#define MAX77705_TEMP_STALE_MS		30000	/* 30 s max age without valid read */
++
++enum max77705_thermal_state {
++	MAX77705_THERM_UNKNOWN = 0,	/* fail-safe: charging blocked until valid read */
++	MAX77705_THERM_NORMAL,
++	MAX77705_THERM_OVERHEAT,
++	MAX77705_THERM_COLD,
++	MAX77705_THERM_FAULT,
++};
++
++enum max77705_field_idx {
++	MAX77705_CHGPROT,
++	MAX77705_CHG_EN,
++	MAX77705_CHG_CC_LIM,
++	MAX77705_CHG_CHGIN_LIM,
++	MAX77705_CHG_CV_PRM,
++	MAX77705_CHG_PQEN,
++	MAX77705_CHG_RSTRT,
++	MAX77705_CHG_WCIN,
++	MAX77705_FCHGTIME,
++	MAX77705_LX_SLOPE,
++	MAX77705_MODE,
++	MAX77705_OTG_ILIM,
++	MAX77705_REG_B2SOVRC,
++	MAX77705_REG_DISKIP,
++	MAX77705_REG_FSW,
++	MAX77705_SYS_TRACK,
++	MAX77705_TO,
++	MAX77705_TO_TIME,
++	MAX77705_VBYPSET,
++	MAX77705_VCHGIN,
++	MAX77705_WCIN,
++	MAX77705_N_REGMAP_FIELDS,
++};
++
++static const struct reg_field max77705_reg_field[MAX77705_N_REGMAP_FIELDS] = {
++	[MAX77705_MODE]			= REG_FIELD(MAX77705_CHG_REG_CNFG_00,   0, 3),
++	[MAX77705_FCHGTIME]		= REG_FIELD(MAX77705_CHG_REG_CNFG_01,   0, 2),
++	[MAX77705_CHG_RSTRT]		= REG_FIELD(MAX77705_CHG_REG_CNFG_01,   4, 5),
++	[MAX77705_CHG_PQEN]		= REG_FIELD(MAX77705_CHG_REG_CNFG_01,   7, 7),
++	[MAX77705_CHG_CC_LIM]		= REG_FIELD(MAX77705_CHG_REG_CNFG_02,   0, 5),
++	[MAX77705_OTG_ILIM]		= REG_FIELD(MAX77705_CHG_REG_CNFG_02,   6, 7),
++	[MAX77705_TO]			= REG_FIELD(MAX77705_CHG_REG_CNFG_03,   0, 2),
++	[MAX77705_TO_TIME]		= REG_FIELD(MAX77705_CHG_REG_CNFG_03,   3, 5),
++	[MAX77705_SYS_TRACK]		= REG_FIELD(MAX77705_CHG_REG_CNFG_03,   7, 7),
++	[MAX77705_CHG_CV_PRM]		= REG_FIELD(MAX77705_CHG_REG_CNFG_04,   0, 5),
++	[MAX77705_REG_B2SOVRC]		= REG_FIELD(MAX77705_CHG_REG_CNFG_05,   0, 3),
++	[MAX77705_CHGPROT]		= REG_FIELD(MAX77705_CHG_REG_CNFG_06,   2, 3),
++	[MAX77705_LX_SLOPE]		= REG_FIELD(MAX77705_CHG_REG_CNFG_06,   5, 6),
++	[MAX77705_REG_FSW]		= REG_FIELD(MAX77705_CHG_REG_CNFG_08,   0, 1),
++	[MAX77705_CHG_CHGIN_LIM]	= REG_FIELD(MAX77705_CHG_REG_CNFG_09,   0, 6),
++	[MAX77705_CHG_EN]		= REG_FIELD(MAX77705_CHG_REG_CNFG_09,   7, 7),
++	[MAX77705_CHG_WCIN]		= REG_FIELD(MAX77705_CHG_REG_CNFG_10,   0, 5),
++	[MAX77705_VBYPSET]		= REG_FIELD(MAX77705_CHG_REG_CNFG_11,   0, 6),
++	[MAX77705_REG_DISKIP]		= REG_FIELD(MAX77705_CHG_REG_CNFG_12,   0, 0),
++	[MAX77705_WCIN]			= REG_FIELD(MAX77705_CHG_REG_CNFG_12,   1, 2),
++	[MAX77705_VCHGIN]		= REG_FIELD(MAX77705_CHG_REG_CNFG_12,   3, 4),
++};
++
++struct max77705_charger_data {
++	struct device			*dev;
++	struct regmap			*regmap;
++	struct regmap_field		*rfield[MAX77705_N_REGMAP_FIELDS];
++	struct power_supply_battery_info *bat_info;
++	struct workqueue_struct		*wqueue;
++	struct work_struct		chgin_work;
++	struct power_supply		*psy_chg;
++	struct delayed_work		poll_work;
++	struct mutex			lock;
++	int				last_online;
++	unsigned int			max_cc_ua;
++	unsigned int			max_chgin_ua;
++	enum max77705_thermal_state	thermal_state;
++	bool				chg_enabled;
++	bool				has_valid_temp;
++	int				last_temp_dc;
++	unsigned long			last_temp_jiffies;
++};
++
++#endif /* __MAX77705_CHARGER_H */
+diff --git a/include/linux/power_supply.h b/include/linux/power_supply.h
+index 1e059ff7a..b0e00f527 100644
+--- a/include/linux/power_supply.h
++++ b/include/linux/power_supply.h
+@@ -68,6 +68,7 @@ enum {
+ 	POWER_SUPPLY_HEALTH_COOL,
+ 	POWER_SUPPLY_HEALTH_HOT,
+ 	POWER_SUPPLY_HEALTH_NO_BATTERY,
++	POWER_SUPPLY_HEALTH_UNDERVOLTAGE,
+ };
+ 
+ enum {
+-- 
+2.56.1
+

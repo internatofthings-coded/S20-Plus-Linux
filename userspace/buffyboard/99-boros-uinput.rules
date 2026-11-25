@@ -1,0 +1,6 @@
+# Restrict /dev/uinput exclusively to root and the dedicated buffyboard user (no uaccess)
+KERNEL=="uinput", SUBSYSTEM=="misc", OWNER="root", GROUP="buffyboard", MODE="0660"
+
+# Restrict physical evdev access to the Samsung Y79A (s6sy761) touchscreen only
+# Mode 0660 required by libinput (O_RDWR); no broad 'input' group granted
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="*s6sy761*", OWNER="root", GROUP="buffyboard", MODE="0660", SYMLINK+="input/boros-touch"

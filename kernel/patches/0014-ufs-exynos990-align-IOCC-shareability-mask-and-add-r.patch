@@ -1,0 +1,124 @@
+From f0ea4103d4521539ab886d9b078983e11762e8b1 Mon Sep 17 00:00:00 2001
+From: Boros Maintainer <boros@local>
+Date: Tue, 24 Nov 2026 20:27:23 +0800
+Subject: [PATCH] ufs: exynos990: align IOCC shareability mask and add
+ read-only diagnostics
+
+---
+ drivers/ufs/core/ufshcd.c     | 19 ++++++++++++++++
+ drivers/ufs/host/ufs-exynos.c | 41 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+index 798ad0338..8e85ff087 100644
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -5503,6 +5503,25 @@ ufshcd_transfer_rsp_status(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
+ 		dev_err(hba->dev,
+ 				"OCS error from controller = %x for tag %d\n",
+ 				ocs, lrbp->task_tag);
++		{
++			const struct utp_transfer_req_desc *utrd = lrbp->utr_descriptor_ptr;
++			const struct ufshcd_sg_entry *prdt0 = lrbp->ucd_prdt_ptr;
++			u16 prdt_len = le16_to_cpu(utrd->prd_table_length);
++
++			dev_err(hba->dev,
++				"B050 OCS diag: tag=%d ocs=0x%x ct=%u dd=%u crypto=%u ucd=0x%llx rsp_off=%u rsp_len=%u prdt_off=%u prdt_len=%u sg_sz=%zu prdt0_addr=0x%llx prdt0_sz=0x%08x\n",
++				lrbp->task_tag, ocs,
++				utrd->header.command_type,
++				utrd->header.data_direction,
++				utrd->header.enable_crypto,
++				(unsigned long long)le64_to_cpu(utrd->command_desc_base_addr),
++				le16_to_cpu(utrd->response_upiu_offset),
++				le16_to_cpu(utrd->response_upiu_length),
++				le16_to_cpu(utrd->prd_table_offset),
++				prdt_len, ufshcd_sg_entry_size(hba),
++				(unsigned long long)((prdt_len && prdt0) ? le64_to_cpu(prdt0->addr) : 0),
++				(prdt_len && prdt0) ? le32_to_cpu(prdt0->size) : 0);
++		}
+ 		ufshcd_print_evt_hist(hba);
+ 		ufshcd_print_host_state(hba);
+ 		break;
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+index 6c626ebbc..068129d29 100644
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -13,6 +13,7 @@
+ #include <linux/arm-smccc.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
++#include <linux/dma-map-ops.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -95,6 +96,10 @@
+ #define UFS_GS101_RD_SHARABLE		BIT(0)
+ #define UFS_GS101_SHARABLE		(UFS_GS101_WR_SHARABLE | \
+ 					 UFS_GS101_RD_SHARABLE)
++#define UFS_EXYNOS990_WR_SHARABLE	BIT(23)
++#define UFS_EXYNOS990_RD_SHARABLE	BIT(22)
++#define UFS_EXYNOS990_SHARABLE		(UFS_EXYNOS990_WR_SHARABLE | \
++					 UFS_EXYNOS990_RD_SHARABLE)
+ #define UFS_SHAREABILITY_OFFSET		0x710
+ 
+ /* Multi-host registers */
+@@ -1061,6 +1066,39 @@ static void exynos_ufs_fit_aggr_timeout(struct exynos_ufs *ufs)
+ 	hci_writel(ufs, val & CNT_VAL_1US_MASK, HCI_1US_TO_CNT_VAL);
+ }
+ 
++/* Boot-050: read-only UFS DMA/coherency diagnostics. No register writes. */
++static void exynos_ufs_diag_dump(struct ufs_hba *hba, struct exynos_ufs *ufs,
++				 const char *when)
++{
++	unsigned int iocc = 0xdeadbeef;
++	int ret = -ENODEV;
++
++	if (ufs->sysreg)
++		ret = regmap_read(ufs->sysreg, ufs->iocc_offset, &iocc);
++
++	dev_info(hba->dev,
++		 "B050 diag(%s): of_dma_coherent=%d dev_coherent=%d dma_mask=%llx iocc_off=0x%x iocc_mask=0x%x iocc_val=0x%x sysreg_read=%d sysreg=0x%08x\n",
++		 when, of_dma_is_coherent(hba->dev->of_node),
++		 dev_is_dma_coherent(hba->dev),
++		 (unsigned long long)(hba->dev->dma_mask ? *hba->dev->dma_mask : 0),
++		 ufs->iocc_offset, ufs->iocc_mask, ufs->iocc_val, ret, iocc);
++	dev_info(hba->dev,
++		 "B050 diag(%s): caps=0x%08x crypto_cap=%d hba_caps=0x%x fmp_crypto=%d opts=0x%x ufspr_secure=%d sg_entry_size=%zu ucdl_dma=%pad utrdl_dma=%pad nutrs=%d quirks=0x%x\n",
++		 when, hba->capabilities,
++		 !!(hba->capabilities & MASK_CRYPTO_SUPPORT),
++		 hba->caps, !!(hba->caps & UFSHCD_CAP_CRYPTO),
++		 ufs->opts, !!(ufs->opts & EXYNOS_UFS_OPT_UFSPR_SECURE),
++		 ufshcd_sg_entry_size(hba), &hba->ucdl_dma_addr,
++		 &hba->utrdl_dma_addr, hba->nutrs, hba->quirks);
++	dev_info(hba->dev,
++		 "B050 diag(%s): HCI nexus_type=0x%08x txprdt=0x%08x rxprdt=0x%08x reorder=0x%08x axi_burst=0x%08x\n",
++		 when, hci_readl(ufs, HCI_UTRL_NEXUS_TYPE),
++		 hci_readl(ufs, HCI_TXPRDT_ENTRY_SIZE),
++		 hci_readl(ufs, HCI_RXPRDT_ENTRY_SIZE),
++		 hci_readl(ufs, HCI_DATA_REORDER),
++		 hci_readl(ufs, HCI_AXIDMA_RWDATA_BURST_LEN));
++}
++
+ static int exynos_ufs_post_link(struct ufs_hba *hba)
+ {
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+@@ -1128,6 +1166,8 @@ static int exynos_ufs_post_link(struct ufs_hba *hba)
+ 	if (ufs->drv_data->post_link)
+ 		ufs->drv_data->post_link(ufs);
+ 
++	exynos_ufs_diag_dump(hba, ufs, "post_link");
++
+ 	return 0;
+ }
+ 
+@@ -2170,6 +2210,7 @@ static const struct exynos_ufs_drv_data exynos990_ufs_drvs = {
+ 				  EXYNOS_UFS_OPT_UFSPR_SECURE |
+ 				  EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR |
+ 				  EXYNOS_UFS_OPT_TIMER_TICK_SELECT,
++	.iocc_mask		= UFS_EXYNOS990_SHARABLE,
+ 	.drv_init		= exynosauto_ufs_drv_init,
+ 	.pre_link		= exynos990_ufs_pre_link,
+ };
+-- 
+2.56.1
+
