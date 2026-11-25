@@ -10,8 +10,11 @@ The complete upstream provenance and applicable license texts still need verific
 
 ## Independently authored material
 
-MIT is proposed for original userspace, TUI, artwork, scripts and documentation, subject to explicit maintainer approval and verification of the right to license that material. [Proposed MIT text](LICENSES/MIT.txt). This proposal does not grant a new license on third-party material or establish that all material is independently authored.
+Contributions, including userspace utilities, TUI, artwork, scripts and documentation, are licensed under GPL-2.0-only.
 
+See [GNU General Public License v2.0].
+
+Third-party components retain their original licenses and copyright notices.
 ## External dependencies
 
 External dependencies retain their respective licenses. No proprietary firmware or compiled binaries are included. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
