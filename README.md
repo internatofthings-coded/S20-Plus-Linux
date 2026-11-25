@@ -16,7 +16,7 @@ Tested on one SM-G985F running Boot-052 (`6.12.119-g970959bbf675`):
 - Battery percentage, charging status, voltage/current, and temperature monitoring.
 - Dynamic login MOTD and editable ANSI artwork.
 - Native Ratatui interface with keyboard navigation and direct shell recovery.
-- USB networking, serial console recovery (maintainer-confirmed), SSH, SCP and SFTP.
+- USB networking, serial console recovery, SSH, SCP and SFTP.
 - Seven core services active after reboot, with zero failed systemd units at the final check.
 
 Wi-Fi link operation was reported during development; Wi-Fi SSH and broader network qualification are not established here. GPU acceleration, audio, cameras, cellular service and suspend-to-RAM are not claimed. Only the SM-G985F was tested; do not assume compatibility with other S20 models.
@@ -42,6 +42,6 @@ Wi-Fi link operation was reported during development; Wi-Fi SSH and broader netw
 
 ## Credits
 
-Special thanks to **Bentlybro** and the Exynos 990 Linux community for the foundational work that made this project possible. Thanks also to Linux, Samsung's open-source contributors, Debian, postmarketOS/Buffyboard, Ratatui and Crossterm. Development was directed and physically tested by the maintainer with substantial assistance from Google Gemini/Antigravity and OpenAI ChatGPT.
+ **Bentlybro** and the Exynos 990 Linux community for the foundational work that made this project possible.  Linux, Samsung's open-source contributors, Debian, postmarketOS/Buffyboard, Ratatui and Crossterm. Development was directed and physically test on my personal device.
 
 See [Acknowledgments](ACKNOWLEDGMENTS.md) for the detailed credits and [Third-party notices](THIRD-PARTY-NOTICES.md) for source links and license information.
