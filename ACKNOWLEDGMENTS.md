@@ -18,7 +18,7 @@ S20-Plus-Linux (NAOMI) would not exist without the work already done by the Linu
 - **[Google Gemini](https://gemini.google.com/)** and **[Google Antigravity](https://antigravity.google/)** — implementation, code analysis, builds, debugging, test development and documentation.
 - **[OpenAI ChatGPT](https://chatgpt.com/)** — architectural planning, research assistance, implementation review, troubleshooting, qualification guidance and documentation review.
 
-The project maintainer directed the development, made scope and safety decisions, and performed the physical device tests. AI tools assisted the work; their involvement does not imply endorsement, independent certification or affiliation with the providers.
+I directed the development,research, made scope, safety decisions, and did physical device tests. AI tools assisted the work; their involvement does not imply endorsement, independent certification or affiliation with the providers.
 
 ## Supporting tools
 
