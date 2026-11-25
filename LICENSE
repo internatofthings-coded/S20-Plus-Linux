@@ -12,7 +12,11 @@ The complete upstream provenance and applicable license texts still need verific
 
 Contributions, including userspace utilities, TUI, artwork, scripts and documentation, are licensed under GPL-2.0-only.
 
-See [GNU General Public License v2.0].
+The full text of the GNU General Public License version 2 is the canonical
+document at https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt and is the
+identical text shipped as COPYING in the Linux kernel source tree. If you
+redistribute this repository, include that full license text as this LICENSE
+file (drop in the kernel COPYING verbatim).
 
 Third-party components retain their original licenses and copyright notices.
 ## External dependencies
