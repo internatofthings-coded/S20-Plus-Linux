@@ -1,6 +1,6 @@
 # Release status — v0.1.0 draft
 
-**Experimental source snapshot; not yet a reproducible installation release.** The maintainer has a working prototype, but this archive is incomplete for a fresh device. Keep the GitHub repository private until the release gates below are resolved.
+**Experimental source snapshot; not yet a reproducible installation release.** a working prototype, but is incomplete, needs hardening.
 
 | Gate | Status / action |
 |---|---|
