@@ -21,4 +21,4 @@ The TUI runs without root privileges; the on-screen keyboard has trusted pre-aut
 
 ## Reporting a Vulnerability
 
-Use private vulnerability reporting if enabled, or contact the maintainer without publicly posting exploit details, via <https://github.com/internatofthings-coded/S20-Plus-Linux>. Do not include device serial numbers, IMEI, EFS dumps, or private keys in reports.
+Use private vulnerability reporting if enabled, or contact without publicly posting exploit details, via <https://github.com/internatofthings-coded/S20-Plus-Linux>. Do not include device serial numbers, IMEI, EFS dumps, or private keys in reports.
